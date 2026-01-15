@@ -506,6 +506,9 @@ class HierarchicalEntropicMemory:
         self.short: Dict[str, List[float]] = {}
         self.mid: Dict[str, List[float]] = {}
         self.long: Dict[str, float] = {}
+        self.last_entropy: Dict[str, float] = {}
+        self.shock_ema: Dict[str, float] = {}
+        self.anomaly_score: Dict[str, float] = {}
 
     def update(self, domain: str, entropy: float) -> None:
         self.short.setdefault(domain, []).append(float(entropy))
@@ -518,6 +521,25 @@ class HierarchicalEntropicMemory:
             b = self.long[domain]
             a = self.baseline_alpha
             self.long[domain] = (1.0 - a) * b + a * float(entropy)
+        prev = self.last_entropy.get(domain, float(entropy))
+        delta = float(entropy) - prev
+        shock_prev = self.shock_ema.get(domain, 0.0)
+        shock_now = 0.85 * shock_prev + 0.15 * abs(delta)
+        self.shock_ema[domain] = shock_now
+        short_var = float(np.var(self.short[domain])) if len(self.short[domain]) >= 2 else 0.0
+        denom = math.sqrt(short_var) + 1e-6
+        self.anomaly_score[domain] = min(6.0, abs(delta) / denom)
+        self.last_entropy[domain] = float(entropy)
+
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
 
     def decay(self, factor: float = 0.998) -> None:
         if not (0.0 < factor <= 1.0):
@@ -544,10 +566,28 @@ class HierarchicalEntropicMemory:
         st = self.stats(domain)
         return float(st["short_mean"] - st["baseline"])
 
+    def weighted_drift(self, domain: str, w_short: float = 0.6, w_mid: float = 0.3, w_long: float = 0.1) -> float:
+        st = self.stats(domain)
+        total = w_short + w_mid + w_long
+        if total <= 0:
+            return 0.0
+        blend = (
+            (w_short / total) * st["short_mean"]
+            + (w_mid / total) * st["mid_mean"]
+            + (w_long / total) * st["baseline"]
+        )
+        return float(blend - st["baseline"])
+
     def confidence(self, domain: str) -> float:
         st = self.stats(domain)
         conf = 1.0 / (1.0 + st["volatility"])
         return float(max(0.1, min(0.99, conf)))
+
+    def shock(self, domain: str) -> float:
+        return float(self.shock_ema.get(domain, 0.0))
+
+    def anomaly(self, domain: str) -> float:
+        return float(self.anomaly_score.get(domain, 0.0))
 
 
 # =============================================================================
@@ -1316,9 +1356,11 @@ class RGNCebSystem:
             d_entropy = domain_entropy_from_slice(sl)
             self.memory.update(d, d_entropy)
 
-            drift = self.memory.drift(d)
+            drift = self.memory.weighted_drift(d)
             conf = self.memory.confidence(d)
             vol = self.memory.stats(d)["volatility"]
+            shock = self.memory.shock(d)
+            anomaly = self.memory.anomaly(d)
 
             base_risk = domain_risk_from_ceb(d, p)
             risk = apply_cross_domain_bias(d, base_risk, self.memory)
