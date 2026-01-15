@@ -541,6 +541,16 @@ class HierarchicalEntropicMemory:
         for domain in list(self.long.keys()):
             self.long[domain] = self.long[domain] * factor
 
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
+
     def stats(self, domain: str) -> Dict[str, float]:
         s = self.short.get(domain, [])
         m = self.mid.get(domain, [])
@@ -636,13 +646,6 @@ def adjust_risk_by_confidence(base_risk: float, confidence: float, volatility: f
     vol_tilt = 1.0 + 0.15 * vol
     adjusted = base_risk * damp * vol_tilt
     return float(np.clip(adjusted, 0.0, 1.0))
-
-
-def adjust_risk_by_instability(base_risk: float, shock: float, anomaly: float) -> float:
-    shock_level = float(np.clip(shock * 1.8, 0.0, 1.0))
-    anomaly_level = float(np.clip(anomaly / 6.0, 0.0, 1.0))
-    lift = 0.10 * shock_level + 0.08 * anomaly_level
-    return float(np.clip(base_risk + lift, 0.0, 1.0))
 
 
 def status_from_risk(r: float) -> str:
@@ -1031,8 +1034,6 @@ class CEBChunker:
                 f"volatility={vol:.6f}",
                 f"ceb_entropy={ent:.4f}",
                 f"quantum_gain={quantum_gain:.4f}",
-                f"shock={metrics.get('shock', 0.0):.4f}",
-                f"anomaly={metrics.get('anomaly', 0.0):.4f}",
             ]), 9.2),
             ("CEB_SIGNATURE", json.dumps(ceb_sig, ensure_ascii=False, indent=2), 8.4),
             ("QUANTUM_ADVANCEMENTS", json.dumps(quantum, ensure_ascii=False, indent=2), 7.9),
@@ -1364,17 +1365,9 @@ class RGNCebSystem:
             base_risk = domain_risk_from_ceb(d, p)
             risk = apply_cross_domain_bias(d, base_risk, self.memory)
             risk = adjust_risk_by_confidence(risk, conf, vol)
-            risk = adjust_risk_by_instability(risk, shock, anomaly)
             status = status_from_risk(risk)
 
-            metrics = {
-                "risk": float(risk),
-                "drift": float(drift),
-                "confidence": float(conf),
-                "volatility": float(vol),
-                "shock": float(shock),
-                "anomaly": float(anomaly),
-            }
+            metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
             quantum_summary = build_quantum_advancements(signals, sig, metrics, loops=5)
             metrics["quantum_gain"] = float(quantum_summary.get("quantum_gain", 0.0))
             metrics["quantum_summary"] = quantum_summary
@@ -1386,8 +1379,6 @@ class RGNCebSystem:
                 round(metrics["drift"], 4),
                 round(metrics["confidence"], 4),
                 round(metrics["volatility"], 4),
-                round(metrics.get("shock", 0.0), 4),
-                round(metrics.get("anomaly", 0.0), 4),
                 round(metrics.get("quantum_gain", 0.0), 4),
                 sig_key,
             )
