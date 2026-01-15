@@ -95,26 +95,3 @@ The dashboard is split into sections that show:
 ## Development notes
 
 The system is built as a single `main.py` entry point with no external configuration files. For modifications, start by scanning the `SystemSignals`, `CEBEngine`, and `PromptOrchestrator` sections, then follow the TUI rendering pipeline in `AdvancedTUI`.
-
-## Ideas to advance the CEB concept
-
-1. Add a replayable entropy capture mode so runs can be compared and reproduced.
-2. Track long-term entropy baselines per domain to visualize multi-session drift.
-3. Introduce pluggable signal sources (GPU, sensors, system logs) for richer entropy.
-4. Provide a calibration phase that learns host-specific entropy distributions.
-5. Add a deterministic test harness with seeded entropy for regression tests.
-6. Visualize CEB state evolution over time as a timeline or sparkline view.
-7. Export CEB signatures as JSON for downstream analysis or integrations.
-8. Add domain-specific lattice weighting to emphasize relevant signals.
-9. Support multiple coupling graphs with runtime selection or tuning.
-10. Implement a “prompt diff” view to compare consecutive prompt plans.
-11. Add anomaly detection that flags entropy spikes and correlates causes.
-12. Provide a configuration file for domain lists, coupling, and thresholds.
-13. Allow custom prompt chunk templates with user-defined sections.
-14. Add a “safe mode” that disables AI calls but logs prompt plans to disk.
-15. Track user interaction metrics (toggles, focus changes) to inform tuning.
-16. Implement a plugin API for new prompt agents and action rules.
-17. Add a compact summary mode for terminals with limited space.
-18. Provide a structured export of metrics for dashboards (CSV/JSON).
-19. Benchmark performance on large domain sets and optimize hot paths.
-20. Explore alternate entropy fusion functions and compare stability.
