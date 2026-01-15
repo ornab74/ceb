@@ -114,6 +114,9 @@ class SystemSignals:
     @staticmethod
     def sample() -> "SystemSignals":
         # Robust sampling: handle sandboxes/containers where /proc/* may be unreadable.
+        # This is intentionally defensive, returning zeros when any probe fails so
+        # the rest of the pipeline (entropy, CEB evolution, TUI) can keep running
+        # without collapsing due to restricted metrics access.
         vm_used = 0
         vm_total = 1
         cpu = 0.0
@@ -221,6 +224,9 @@ class SignalPipeline:
 # RGB ENTROPY + LATTICE
 # =============================================================================
 def rgb_entropy_wheel(signals: SystemSignals) -> np.ndarray:
+    # Generate a compact RGB seed that fuses instantaneous signals, jitter,
+    # and uptime into a phase. The seed is intentionally lossy: we want a
+    # chaotic-but-stable entropy anchor rather than a raw telemetry dump.
     t = time.perf_counter_ns()
     uptime_bits = int(signals.uptime_s * 1e6)
     proc_bits = int(signals.proc_count)
@@ -251,6 +257,9 @@ def rgb_quantum_lattice(signals: SystemSignals) -> np.ndarray:
     - fuse base bytes with entropy RGB via add + xor (uint8)
     - convert to normalized float vector in [-1,1] then normalize
     """
+    # The lattice is a normalized vector that acts like a "phase space"
+    # background for the CEB evolution. It is derived from signal bytes
+    # plus a hint of randomness to avoid deterministic lock-in.
     rgb = rgb_entropy_wheel(signals).astype(np.uint8)
 
     t = time.perf_counter_ns()
@@ -432,6 +441,10 @@ class CEBEngine:
         drift_bias: float = 0.0,
         chroma_gain: float = 1.0,
     ) -> CEBState:
+        # The evolve step advances amplitudes and colors through a coupled
+        # non-linear system. It uses entropy to modulate phase, lattice
+        # coupling, and chroma rotation. The goal is a rich probability
+        # distribution rather than a single dominant peak.
         drift_bias = float(np.clip(drift_bias, -0.75, 0.75))
         amps = st.amps.copy()
         colors = st.colors.copy()
@@ -511,6 +524,8 @@ class HierarchicalEntropicMemory:
         self.anomaly_score: Dict[str, float] = {}
 
     def update(self, domain: str, entropy: float) -> None:
+        # Maintain multi-horizon traces (short/mid/long) and compute
+        # shock/anomaly signals based on delta relative to recent variance.
         self.short.setdefault(domain, []).append(float(entropy))
         self.mid.setdefault(domain, []).append(float(entropy))
         self.short[domain] = self.short[domain][-self.short_n:]
@@ -1567,6 +1582,9 @@ class AdvancedTUI:
                 self._run_ai_for_focus()
 
     def _draw(self, stdscr) -> None:
+        # Render a full frame: dashboard, signature, prompt panel, logs,
+        # and a signal status bar. Keep operations small to stay within
+        # the TUI refresh cadence.
         stdscr.erase()
         h, w = stdscr.getmaxyx()
 
@@ -1720,6 +1738,8 @@ class AdvancedTUI:
         stdscr.addstr(y, 0, msg[: max(0, width - 1)], curses.A_REVERSE)
 
     def _run_ai_for_focus(self) -> None:
+        # AI calls are optional and rate-limited. We enforce cooldown to
+        # prevent repeated API calls from overwhelming the user or quota.
         focus = self.sys.get_focus_domain()
         with self._lock:
             s = self.scans.get(focus)
