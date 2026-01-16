@@ -83,6 +83,9 @@ MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
 LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
 BOOK_TITLE = os.environ.get("BOOK_TITLE", os.environ.get("RGN_BOOK_TITLE", "")).strip()
+MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
+AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
+LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
 
 DEFAULT_DOMAINS = [
     "road_risk",
@@ -207,6 +210,12 @@ class SignalPipeline:
         if self.last is None:
             self.last = raw
             self.last_smoothed = raw
+    last_time: float = 0.0
+
+    def update(self, raw: SystemSignals) -> SystemSignals:
+        now = time.time()
+        if self.last is None:
+            self.last = raw
             self.last_time = now
             return raw
 
@@ -227,11 +236,21 @@ class SignalPipeline:
             ram_total=raw.ram_total,
             cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
             disk_percent=ema(prev.disk_percent, raw.disk_percent),
+        smoothed = SystemSignals(
+            ram_used=int(ema(float(prev.ram_used), float(raw.ram_used))),
+            ram_total=raw.ram_total,
+            cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(prev.disk_percent, raw.disk_percent),
+            ram_used=int(ema(float(self.last.ram_used), float(raw.ram_used))),
+            ram_total=raw.ram_total,
+            cpu_percent=ema(self.last.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(self.last.disk_percent, raw.disk_percent),
             net_sent=raw.net_sent,
             net_recv=raw.net_recv,
             uptime_s=raw.uptime_s,
             proc_count=raw.proc_count,
             ram_ratio=float(smoothed_ram_used) / float(raw.ram_total or 1),
+            ram_ratio=float(raw.ram_used) / float(raw.ram_total or 1),
             net_rate=net_rate,
             cpu_jitter=cpu_jitter,
             disk_jitter=disk_jitter,
@@ -568,6 +587,16 @@ class HierarchicalEntropicMemory:
         denom = math.sqrt(short_var) + 1e-6
         self.anomaly_score[domain] = min(6.0, abs(delta) / denom)
         self.last_entropy[domain] = float(entropy)
+
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
 
     def decay(self, factor: float = 0.998) -> None:
         if not (0.0 < factor <= 1.0):
@@ -2037,6 +2066,7 @@ class HttpxOpenAIClient:
         payload = {
             "model": self.model,
             "input": prompt,
+            "input": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
             "max_output_tokens": int(max_tokens),
             "store": False,
@@ -2071,6 +2101,11 @@ class HttpxOpenAIClient:
                 t = part.get("text")
                 if isinstance(t, str) and t.strip():
                     texts.append(t)
+            if item.get("type") == "message":
+                for part in item.get("content", []) or []:
+                    t = part.get("text")
+                    if isinstance(t, str) and t.strip():
+                        texts.append(t)
         return "\n".join(texts).strip()
 
     def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
@@ -2088,6 +2123,144 @@ class HttpxGrokClient:
             raise RuntimeError("GROK_API_KEY not set.")
         if not base_url:
             raise RuntimeError("GROK_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, headers=headers, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Grok call failed: {last_err}")
+
+
+class HttpxGeminiClient:
+    def __init__(self, api_key: str, base_url: str = GEMINI_BASE_URL, model: str = GEMINI_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GEMINI_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Gemini call failed: {last_err}")
+
+
+def download_llama3_model(target_path: str) -> None:
+    if not LLAMA3_MODEL_URL or not LLAMA3_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_MODEL_URL or LLAMA3_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3 model hash mismatch.")
+
+
+def download_llama3_2_model(target_path: str) -> None:
+    if not LLAMA3_2_MODEL_URL or not LLAMA3_2_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_2_MODEL_URL or LLAMA3_2_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_2_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_2_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3.2 model hash mismatch.")
+
+
+def encrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    data = Path(src_path).read_bytes()
+    encrypted = aesgcm.encrypt(nonce, data, None)
+    Path(dst_path).write_bytes(nonce + encrypted)
+
+
+def decrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    blob = Path(src_path).read_bytes()
+    nonce = blob[:12]
+    data = blob[12:]
+    decrypted = aesgcm.decrypt(nonce, data, None)
+    Path(dst_path).write_bytes(decrypted)
+
+    def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        chunks = chunk_text_for_longform(prompt, max_chars=3800)
+        outputs = []
+        for idx, chunk in enumerate(chunks, start=1):
+            header = f"[CHUNK {idx}/{len(chunks)}]\n"
+            outputs.append(self.chat(header + chunk, temperature=temperature, max_tokens=max_tokens, retries=retries))
+        return concat_longform(outputs)
+
+
+class HttpxGrokClient:
+    def __init__(self, api_key: str, base_url: str = GROK_BASE_URL, model: str = GROK_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GROK_API_KEY not set.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -2303,6 +2476,9 @@ class RGNCebSystem:
                 "shock": float(shock),
                 "anomaly": float(anomaly),
             }
+            status = status_from_risk(risk)
+
+            metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
             quantum_summary = build_quantum_advancements(signals, sig, metrics, loops=5)
             metrics["quantum_gain"] = float(quantum_summary.get("quantum_gain", 0.0))
             metrics["quantum_summary"] = quantum_summary
