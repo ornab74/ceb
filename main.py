@@ -68,6 +68,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-2")
+GROK_BASE_URL = os.environ.get("GROK_BASE_URL", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "").strip()
+LLAMA3_MODEL_URL = os.environ.get("LLAMA3_MODEL_URL", "")
+LLAMA3_MODEL_SHA256 = os.environ.get("LLAMA3_MODEL_SHA256", "")
+LLAMA3_2_MODEL_URL = os.environ.get("LLAMA3_2_MODEL_URL", "")
+LLAMA3_2_MODEL_SHA256 = os.environ.get("LLAMA3_2_MODEL_SHA256", "")
+LLAMA3_AES_KEY_B64 = os.environ.get("LLAMA3_AES_KEY_B64", "")
+MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
+AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
+LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
+BOOK_TITLE = os.environ.get("BOOK_TITLE", os.environ.get("RGN_BOOK_TITLE", "")).strip()
 MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
 LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
@@ -184,6 +199,17 @@ class SystemSignals:
 class SignalPipeline:
     alpha: float = 0.22
     last: Optional[SystemSignals] = None
+    last_smoothed: Optional[SystemSignals] = None
+    last_time: float = 0.0
+
+    def update(self, raw: SystemSignals) -> SystemSignals:
+        # Smooth input signals with a lightweight EMA and derive delta-based
+        # metrics (net_rate, jitter). This trades a little latency for a big
+        # reduction in noisy spikes that can destabilize downstream prompts.
+        now = time.time()
+        if self.last is None:
+            self.last = raw
+            self.last_smoothed = raw
     last_time: float = 0.0
 
     def update(self, raw: SystemSignals) -> SystemSignals:
@@ -199,10 +225,16 @@ class SignalPipeline:
         cpu_jitter = abs(raw.cpu_percent - self.last.cpu_percent)
         disk_jitter = abs(raw.disk_percent - self.last.disk_percent)
 
+        prev = self.last_smoothed or self.last
+
         def ema(prev: float, cur: float) -> float:
             return (1.0 - self.alpha) * prev + self.alpha * cur
 
         smoothed = SystemSignals(
+            ram_used=int(ema(float(prev.ram_used), float(raw.ram_used))),
+            ram_total=raw.ram_total,
+            cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(prev.disk_percent, raw.disk_percent),
             ram_used=int(ema(float(self.last.ram_used), float(raw.ram_used))),
             ram_total=raw.ram_total,
             cpu_percent=ema(self.last.cpu_percent, raw.cpu_percent),
@@ -218,6 +250,7 @@ class SignalPipeline:
         )
 
         self.last = raw
+        self.last_smoothed = smoothed
         self.last_time = now
         return smoothed
 
@@ -584,6 +617,8 @@ class HierarchicalEntropicMemory:
         return float(st["short_mean"] - st["baseline"])
 
     def weighted_drift(self, domain: str, w_short: float = 0.6, w_mid: float = 0.3, w_long: float = 0.1) -> float:
+        # Blend short/mid/long signals into a single drift value, then
+        # compare back to the long baseline to maintain a stable center.
         st = self.stats(domain)
         total = w_short + w_mid + w_long
         if total <= 0:
@@ -663,6 +698,13 @@ def adjust_risk_by_confidence(base_risk: float, confidence: float, volatility: f
     vol_tilt = 1.0 + 0.15 * vol
     adjusted = base_risk * damp * vol_tilt
     return float(np.clip(adjusted, 0.0, 1.0))
+
+
+def adjust_risk_by_instability(base_risk: float, shock: float, anomaly: float) -> float:
+    shock_level = float(np.clip(shock * 1.8, 0.0, 1.0))
+    anomaly_level = float(np.clip(anomaly / 6.0, 0.0, 1.0))
+    lift = 0.10 * shock_level + 0.08 * anomaly_level
+    return float(np.clip(base_risk + lift, 0.0, 1.0))
 
 
 def status_from_risk(r: float) -> str:
@@ -1665,6 +1707,10 @@ class CEBChunker:
         base_rgb: np.ndarray,
         signal_summary: Optional[Dict[str, Any]] = None,
     ) -> List[PromptChunk]:
+        # Build a prioritized list of prompt chunks. Required chunks anchor
+        # structure; optional chunks add advanced guidance based on quantum
+        # gain, risk, and uncertainty. This keeps prompts adaptive without
+        # exploding length.
         top = ceb_sig.get("top", [])
         ent = float(ceb_sig.get("entropy", 0.0))
         quantum = metrics.get("quantum_summary", {})
@@ -1753,6 +1799,8 @@ class CEBChunker:
                 f"volatility={vol:.6f}",
                 f"ceb_entropy={ent:.4f}",
                 f"quantum_gain={quantum_gain:.4f}",
+                f"shock={metrics.get('shock', 0.0):.4f}",
+                f"anomaly={metrics.get('anomaly', 0.0):.4f}",
             ]), 9.2),
             ("CEB_SIGNATURE", json.dumps(ceb_sig, ensure_ascii=False, indent=2), 8.4),
             ("QUANTUM_ADVANCEMENTS", json.dumps(quantum, ensure_ascii=False, indent=2), 7.9),
@@ -1776,6 +1824,23 @@ class CEBChunker:
             ("HYPOTHESIS_LATTICE", hypothesis_lattice(), 7.2),
             ("RESPONSE_TUNING", response_tuning(), 7.1),
         ]
+        if domain == "book_generator":
+            book_chunks = [
+                ("BOOK_BLUEPRINT", build_book_blueprint(), 8.5),
+                ("BOOK_QUALITY_MATRIX", build_book_quality_matrix(), 8.3),
+                ("BOOK_DELIVERY_SPEC", build_book_delivery_spec(), 8.2),
+                ("REVOLUTIONARY_IDEAS", build_book_revolutionary_ideas(), 8.1),
+                ("REVOLUTIONARY_IDEAS_V2", build_book_revolutionary_ideas_v2(), 8.05),
+                ("BOOK_REVIEW_STACK", build_book_review_stack(), 8.0),
+                ("PUBLISHING_POLISHER", build_publishing_polisher(), 7.95),
+                ("SEMANTIC_CLARITY", build_semantic_clarity_stack(), 7.9),
+                ("GENRE_MATRIX", build_genre_matrix(), 7.85),
+                ("VOICE_READING_PLAN", build_voice_reading_plan(), 7.8),
+                ("REVOLUTIONARY_DEPLOYMENTS", build_book_revolutionary_deployments(), 8.0),
+                ("REVOLUTIONARY_DEPLOYMENTS_EXT", build_book_revolutionary_deployments_extended(), 7.95),
+                ("REVOLUTIONARY_DEPLOYMENTS_SUPER", build_book_revolutionary_deployments_super(), 7.9),
+            ]
+            optional_chunks.extend(book_chunks)
 
         if risk >= 0.66 or quantum_gain >= 0.7:
             optional_chunks.append((
@@ -1794,6 +1859,8 @@ class CEBChunker:
         required_titles = {"SYSTEM_HEADER", "STATE_METRICS", "DOMAIN_SPEC", "USER_CONTEXT", "OUTPUT_SCHEMA", "NONNEGOTIABLE_RULES"}
 
         base_count = len(base_chunks)
+        # The target max chunk count scales with quantum_gain to surface
+        # more advanced instructions when the system is "coherent."
         target_max = min(self.max_chunks, max(base_count, 10 + int(quantum_gain * 4)))
         required = [c for c in chunks if c[0] in required_titles]
         optional = [c for c in chunks if c[0] not in required_titles]
@@ -1943,6 +2010,8 @@ class PromptOrchestrator:
         with_rgb_tags: bool = True,
         signal_summary: Optional[Dict[str, Any]] = None,
     ) -> PromptPlan:
+        # Orchestrate chunk building, agent actions, and length guarding into a
+        # final PromptPlan with metadata for debugging/telemetry.
         chunks = self.chunker.build(
             domain=domain,
             metrics=metrics,
@@ -1985,6 +2054,65 @@ class HttpxOpenAIClient:
         self.timeout = httpx.Timeout(timeout_s)
 
     def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/responses"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        payload = {
+            "model": self.model,
+            "input": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature),
+            "max_output_tokens": int(max_tokens),
+            "store": False,
+        }
+
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, headers=headers, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    out = self._extract_text_from_responses_api(j)
+                    if out:
+                        return out
+                    return json.dumps(j, ensure_ascii=False)
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"OpenAI call failed: {last_err}")
+
+    @staticmethod
+    def _extract_text_from_responses_api(j: Dict[str, Any]) -> str:
+        texts: List[str] = []
+        for item in j.get("output", []) or []:
+            if item.get("type") == "message":
+                for part in item.get("content", []) or []:
+                    t = part.get("text")
+                    if isinstance(t, str) and t.strip():
+                        texts.append(t)
+        return "\n".join(texts).strip()
+
+    def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        chunks = chunk_text_for_longform(prompt, max_chars=3800)
+        outputs = []
+        for idx, chunk in enumerate(chunks, start=1):
+            header = f"[CHUNK {idx}/{len(chunks)}]\n"
+            outputs.append(self.chat(header + chunk, temperature=temperature, max_tokens=max_tokens, retries=retries))
+        return concat_longform(outputs)
+
+
+class HttpxGrokClient:
+    def __init__(self, api_key: str, base_url: str = GROK_BASE_URL, model: str = GROK_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GROK_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GROK_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
         url = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
         payload = {
@@ -1993,7 +2121,6 @@ class HttpxOpenAIClient:
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
-
         last_err: Optional[Exception] = None
         with httpx.Client(timeout=self.timeout) as client:
             for attempt in range(int(retries)):
@@ -2006,7 +2133,104 @@ class HttpxOpenAIClient:
                 except Exception as e:
                     last_err = e
                     time.sleep((2 ** attempt) * 0.6)
-        raise RuntimeError(f"OpenAI call failed: {last_err}")
+        raise RuntimeError(f"Grok call failed: {last_err}")
+
+
+class HttpxGeminiClient:
+    def __init__(self, api_key: str, base_url: str = GEMINI_BASE_URL, model: str = GEMINI_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GEMINI_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Gemini call failed: {last_err}")
+
+
+def download_llama3_model(target_path: str) -> None:
+    if not LLAMA3_MODEL_URL or not LLAMA3_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_MODEL_URL or LLAMA3_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3 model hash mismatch.")
+
+
+def download_llama3_2_model(target_path: str) -> None:
+    if not LLAMA3_2_MODEL_URL or not LLAMA3_2_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_2_MODEL_URL or LLAMA3_2_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_2_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_2_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3.2 model hash mismatch.")
+
+
+def encrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    data = Path(src_path).read_bytes()
+    encrypted = aesgcm.encrypt(nonce, data, None)
+    Path(dst_path).write_bytes(nonce + encrypted)
+
+
+def decrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    blob = Path(src_path).read_bytes()
+    nonce = blob[:12]
+    data = blob[12:]
+    decrypted = aesgcm.decrypt(nonce, data, None)
+    Path(dst_path).write_bytes(decrypted)
 
     def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
         chunks = chunk_text_for_longform(prompt, max_chars=3800)
@@ -2180,6 +2404,9 @@ class RGNCebSystem:
         self._lock = threading.Lock()
 
     def scan_once(self) -> Dict[str, DomainScan]:
+        # One full scan: sample signals, build entropy/lattice, evolve CEBs,
+        # compute per-domain metrics, and assemble prompt plans. This is the
+        # main heartbeat of the system.
         raw_signals = SystemSignals.sample()
         signals = self.signal_pipeline.update(raw_signals)
         self.last_signals = signals
@@ -2220,6 +2447,17 @@ class RGNCebSystem:
             base_risk = domain_risk_from_ceb(d, p)
             risk = apply_cross_domain_bias(d, base_risk, self.memory)
             risk = adjust_risk_by_confidence(risk, conf, vol)
+            risk = adjust_risk_by_instability(risk, shock, anomaly)
+            status = status_from_risk(risk)
+
+            metrics = {
+                "risk": float(risk),
+                "drift": float(drift),
+                "confidence": float(conf),
+                "volatility": float(vol),
+                "shock": float(shock),
+                "anomaly": float(anomaly),
+            }
             status = status_from_risk(risk)
 
             metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
@@ -2234,6 +2472,8 @@ class RGNCebSystem:
                 round(metrics["drift"], 4),
                 round(metrics["confidence"], 4),
                 round(metrics["volatility"], 4),
+                round(metrics.get("shock", 0.0), 4),
+                round(metrics.get("anomaly", 0.0), 4),
                 round(metrics.get("quantum_gain", 0.0), 4),
                 sig_key,
             )
