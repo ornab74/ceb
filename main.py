@@ -68,21 +68,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
-GROK_MODEL = os.environ.get("GROK_MODEL", "grok-2-latest")
-GROK_BASE_URL = os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
-LLAMA3_MODEL_URL = os.environ.get("LLAMA3_MODEL_URL", "")
-LLAMA3_MODEL_SHA256 = os.environ.get("LLAMA3_MODEL_SHA256", "")
-LLAMA3_2_MODEL_URL = os.environ.get("LLAMA3_2_MODEL_URL", "")
-LLAMA3_2_MODEL_SHA256 = os.environ.get("LLAMA3_2_MODEL_SHA256", "")
-LLAMA3_AES_KEY_B64 = os.environ.get("LLAMA3_AES_KEY_B64", "")
 MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
 LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
-BOOK_TITLE = os.environ.get("RGN_BOOK_TITLE", "").strip()
 
 DEFAULT_DOMAINS = [
     "road_risk",
@@ -199,9 +187,6 @@ class SignalPipeline:
     last_time: float = 0.0
 
     def update(self, raw: SystemSignals) -> SystemSignals:
-        # Smooth input signals with a lightweight EMA and derive delta-based
-        # metrics (net_rate, jitter). This trades a little latency for a big
-        # reduction in noisy spikes that can destabilize downstream prompts.
         now = time.time()
         if self.last is None:
             self.last = raw
@@ -573,6 +558,16 @@ class HierarchicalEntropicMemory:
         for domain in list(self.long.keys()):
             self.long[domain] = self.long[domain] * factor
 
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
+
     def stats(self, domain: str) -> Dict[str, float]:
         s = self.short.get(domain, [])
         m = self.mid.get(domain, [])
@@ -589,8 +584,6 @@ class HierarchicalEntropicMemory:
         return float(st["short_mean"] - st["baseline"])
 
     def weighted_drift(self, domain: str, w_short: float = 0.6, w_mid: float = 0.3, w_long: float = 0.1) -> float:
-        # Blend short/mid/long signals into a single drift value, then
-        # compare back to the long baseline to maintain a stable center.
         st = self.stats(domain)
         total = w_short + w_mid + w_long
         if total <= 0:
@@ -670,13 +663,6 @@ def adjust_risk_by_confidence(base_risk: float, confidence: float, volatility: f
     vol_tilt = 1.0 + 0.15 * vol
     adjusted = base_risk * damp * vol_tilt
     return float(np.clip(adjusted, 0.0, 1.0))
-
-
-def adjust_risk_by_instability(base_risk: float, shock: float, anomaly: float) -> float:
-    shock_level = float(np.clip(shock * 1.8, 0.0, 1.0))
-    anomaly_level = float(np.clip(anomaly / 6.0, 0.0, 1.0))
-    lift = 0.10 * shock_level + 0.08 * anomaly_level
-    return float(np.clip(base_risk + lift, 0.0, 1.0))
 
 
 def status_from_risk(r: float) -> str:
@@ -1679,10 +1665,6 @@ class CEBChunker:
         base_rgb: np.ndarray,
         signal_summary: Optional[Dict[str, Any]] = None,
     ) -> List[PromptChunk]:
-        # Build a prioritized list of prompt chunks. Required chunks anchor
-        # structure; optional chunks add advanced guidance based on quantum
-        # gain, risk, and uncertainty. This keeps prompts adaptive without
-        # exploding length.
         top = ceb_sig.get("top", [])
         ent = float(ceb_sig.get("entropy", 0.0))
         quantum = metrics.get("quantum_summary", {})
@@ -1771,8 +1753,6 @@ class CEBChunker:
                 f"volatility={vol:.6f}",
                 f"ceb_entropy={ent:.4f}",
                 f"quantum_gain={quantum_gain:.4f}",
-                f"shock={metrics.get('shock', 0.0):.4f}",
-                f"anomaly={metrics.get('anomaly', 0.0):.4f}",
             ]), 9.2),
             ("CEB_SIGNATURE", json.dumps(ceb_sig, ensure_ascii=False, indent=2), 8.4),
             ("QUANTUM_ADVANCEMENTS", json.dumps(quantum, ensure_ascii=False, indent=2), 7.9),
@@ -1796,23 +1776,6 @@ class CEBChunker:
             ("HYPOTHESIS_LATTICE", hypothesis_lattice(), 7.2),
             ("RESPONSE_TUNING", response_tuning(), 7.1),
         ]
-        if domain == "book_generator":
-            book_chunks = [
-                ("BOOK_BLUEPRINT", build_book_blueprint(), 8.5),
-                ("BOOK_QUALITY_MATRIX", build_book_quality_matrix(), 8.3),
-                ("BOOK_DELIVERY_SPEC", build_book_delivery_spec(), 8.2),
-                ("REVOLUTIONARY_IDEAS", build_book_revolutionary_ideas(), 8.1),
-                ("REVOLUTIONARY_IDEAS_V2", build_book_revolutionary_ideas_v2(), 8.05),
-                ("BOOK_REVIEW_STACK", build_book_review_stack(), 8.0),
-                ("PUBLISHING_POLISHER", build_publishing_polisher(), 7.95),
-                ("SEMANTIC_CLARITY", build_semantic_clarity_stack(), 7.9),
-                ("GENRE_MATRIX", build_genre_matrix(), 7.85),
-                ("VOICE_READING_PLAN", build_voice_reading_plan(), 7.8),
-                ("REVOLUTIONARY_DEPLOYMENTS", build_book_revolutionary_deployments(), 8.0),
-                ("REVOLUTIONARY_DEPLOYMENTS_EXT", build_book_revolutionary_deployments_extended(), 7.95),
-                ("REVOLUTIONARY_DEPLOYMENTS_SUPER", build_book_revolutionary_deployments_super(), 7.9),
-            ]
-            optional_chunks.extend(book_chunks)
 
         if risk >= 0.66 or quantum_gain >= 0.7:
             optional_chunks.append((
@@ -1831,8 +1794,6 @@ class CEBChunker:
         required_titles = {"SYSTEM_HEADER", "STATE_METRICS", "DOMAIN_SPEC", "USER_CONTEXT", "OUTPUT_SCHEMA", "NONNEGOTIABLE_RULES"}
 
         base_count = len(base_chunks)
-        # The target max chunk count scales with quantum_gain to surface
-        # more advanced instructions when the system is "coherent."
         target_max = min(self.max_chunks, max(base_count, 10 + int(quantum_gain * 4)))
         required = [c for c in chunks if c[0] in required_titles]
         optional = [c for c in chunks if c[0] not in required_titles]
@@ -1982,8 +1943,6 @@ class PromptOrchestrator:
         with_rgb_tags: bool = True,
         signal_summary: Optional[Dict[str, Any]] = None,
     ) -> PromptPlan:
-        # Orchestrate chunk building, agent actions, and length guarding into a
-        # final PromptPlan with metadata for debugging/telemetry.
         chunks = self.chunker.build(
             domain=domain,
             metrics=metrics,
@@ -2221,9 +2180,6 @@ class RGNCebSystem:
         self._lock = threading.Lock()
 
     def scan_once(self) -> Dict[str, DomainScan]:
-        # One full scan: sample signals, build entropy/lattice, evolve CEBs,
-        # compute per-domain metrics, and assemble prompt plans. This is the
-        # main heartbeat of the system.
         raw_signals = SystemSignals.sample()
         signals = self.signal_pipeline.update(raw_signals)
         self.last_signals = signals
@@ -2264,17 +2220,9 @@ class RGNCebSystem:
             base_risk = domain_risk_from_ceb(d, p)
             risk = apply_cross_domain_bias(d, base_risk, self.memory)
             risk = adjust_risk_by_confidence(risk, conf, vol)
-            risk = adjust_risk_by_instability(risk, shock, anomaly)
             status = status_from_risk(risk)
 
-            metrics = {
-                "risk": float(risk),
-                "drift": float(drift),
-                "confidence": float(conf),
-                "volatility": float(vol),
-                "shock": float(shock),
-                "anomaly": float(anomaly),
-            }
+            metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
             quantum_summary = build_quantum_advancements(signals, sig, metrics, loops=5)
             metrics["quantum_gain"] = float(quantum_summary.get("quantum_gain", 0.0))
             metrics["quantum_summary"] = quantum_summary
@@ -2286,8 +2234,6 @@ class RGNCebSystem:
                 round(metrics["drift"], 4),
                 round(metrics["confidence"], 4),
                 round(metrics["volatility"], 4),
-                round(metrics.get("shock", 0.0), 4),
-                round(metrics.get("anomaly", 0.0), 4),
                 round(metrics.get("quantum_gain", 0.0), 4),
                 sig_key,
             )
