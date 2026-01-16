@@ -76,6 +76,8 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
 LLAMA3_MODEL_URL = os.environ.get("LLAMA3_MODEL_URL", "")
 LLAMA3_MODEL_SHA256 = os.environ.get("LLAMA3_MODEL_SHA256", "")
+LLAMA3_2_MODEL_URL = os.environ.get("LLAMA3_2_MODEL_URL", "")
+LLAMA3_2_MODEL_SHA256 = os.environ.get("LLAMA3_2_MODEL_SHA256", "")
 LLAMA3_AES_KEY_B64 = os.environ.get("LLAMA3_AES_KEY_B64", "")
 MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
@@ -4542,19 +4544,22 @@ class CEBChunker:
             ("RESPONSE_TUNING", response_tuning(), 7.1),
         ]
         if domain == "book_generator":
-            optional_chunks.append(("BOOK_BLUEPRINT", build_book_blueprint(), 8.5))
-            optional_chunks.append(("BOOK_QUALITY_MATRIX", build_book_quality_matrix(), 8.3))
-            optional_chunks.append(("BOOK_DELIVERY_SPEC", build_book_delivery_spec(), 8.2))
-            optional_chunks.append(("REVOLUTIONARY_IDEAS", build_book_revolutionary_ideas(), 8.1))
-            optional_chunks.append(("REVOLUTIONARY_IDEAS_V2", build_book_revolutionary_ideas_v2(), 8.05))
-            optional_chunks.append(("BOOK_REVIEW_STACK", build_book_review_stack(), 8.0))
-            optional_chunks.append(("PUBLISHING_POLISHER", build_publishing_polisher(), 7.95))
-            optional_chunks.append(("SEMANTIC_CLARITY", build_semantic_clarity_stack(), 7.9))
-            optional_chunks.append(("GENRE_MATRIX", build_genre_matrix(), 7.85))
-            optional_chunks.append(("VOICE_READING_PLAN", build_voice_reading_plan(), 7.8))
-            optional_chunks.append(("REVOLUTIONARY_DEPLOYMENTS", build_book_revolutionary_deployments(), 8.0))
-            optional_chunks.append(("REVOLUTIONARY_DEPLOYMENTS_EXT", build_book_revolutionary_deployments_extended(), 7.95))
-            optional_chunks.append(("REVOLUTIONARY_DEPLOYMENTS_SUPER", build_book_revolutionary_deployments_super(), 7.9))
+            book_chunks = [
+                ("BOOK_BLUEPRINT", build_book_blueprint(), 8.5),
+                ("BOOK_QUALITY_MATRIX", build_book_quality_matrix(), 8.3),
+                ("BOOK_DELIVERY_SPEC", build_book_delivery_spec(), 8.2),
+                ("REVOLUTIONARY_IDEAS", build_book_revolutionary_ideas(), 8.1),
+                ("REVOLUTIONARY_IDEAS_V2", build_book_revolutionary_ideas_v2(), 8.05),
+                ("BOOK_REVIEW_STACK", build_book_review_stack(), 8.0),
+                ("PUBLISHING_POLISHER", build_publishing_polisher(), 7.95),
+                ("SEMANTIC_CLARITY", build_semantic_clarity_stack(), 7.9),
+                ("GENRE_MATRIX", build_genre_matrix(), 7.85),
+                ("VOICE_READING_PLAN", build_voice_reading_plan(), 7.8),
+                ("REVOLUTIONARY_DEPLOYMENTS", build_book_revolutionary_deployments(), 8.0),
+                ("REVOLUTIONARY_DEPLOYMENTS_EXT", build_book_revolutionary_deployments_extended(), 7.95),
+                ("REVOLUTIONARY_DEPLOYMENTS_SUPER", build_book_revolutionary_deployments_super(), 7.9),
+            ]
+            optional_chunks.extend(book_chunks)
 
         if risk >= 0.66 or quantum_gain >= 0.7:
             optional_chunks.append((
@@ -4881,6 +4886,26 @@ def download_llama3_model(target_path: str) -> None:
     if hasher.hexdigest().lower() != LLAMA3_MODEL_SHA256.lower():
         target.unlink(missing_ok=True)
         raise RuntimeError("Llama3 model hash mismatch.")
+
+
+def download_llama3_2_model(target_path: str) -> None:
+    if not LLAMA3_2_MODEL_URL or not LLAMA3_2_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_2_MODEL_URL or LLAMA3_2_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_2_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_2_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3.2 model hash mismatch.")
 
 
 def encrypt_llama3_model(src_path: str, dst_path: str) -> None:
