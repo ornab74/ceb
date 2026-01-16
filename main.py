@@ -66,7 +66,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # CONSTANTS
 # =============================================================================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
 GROK_MODEL = os.environ.get("GROK_MODEL", "grok-2")
@@ -230,6 +230,12 @@ class SignalPipeline:
         def ema(prev: float, cur: float) -> float:
             return (1.0 - self.alpha) * prev + self.alpha * cur
 
+        smoothed_ram_used = int(ema(float(prev.ram_used), float(raw.ram_used)))
+        smoothed = SystemSignals(
+            ram_used=smoothed_ram_used,
+            ram_total=raw.ram_total,
+            cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(prev.disk_percent, raw.disk_percent),
         smoothed = SystemSignals(
             ram_used=int(ema(float(prev.ram_used), float(raw.ram_used))),
             ram_total=raw.ram_total,
@@ -243,6 +249,7 @@ class SignalPipeline:
             net_recv=raw.net_recv,
             uptime_s=raw.uptime_s,
             proc_count=raw.proc_count,
+            ram_ratio=float(smoothed_ram_used) / float(raw.ram_total or 1),
             ram_ratio=float(raw.ram_used) / float(raw.ram_total or 1),
             net_rate=net_rate,
             cpu_jitter=cpu_jitter,
@@ -2058,6 +2065,7 @@ class HttpxOpenAIClient:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
         payload = {
             "model": self.model,
+            "input": prompt,
             "input": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
             "max_output_tokens": int(max_tokens),
@@ -2085,6 +2093,14 @@ class HttpxOpenAIClient:
     def _extract_text_from_responses_api(j: Dict[str, Any]) -> str:
         texts: List[str] = []
         for item in j.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content", []) or []:
+                if part.get("type") != "output_text":
+                    continue
+                t = part.get("text")
+                if isinstance(t, str) and t.strip():
+                    texts.append(t)
             if item.get("type") == "message":
                 for part in item.get("content", []) or []:
                     t = part.get("text")
@@ -2278,6 +2294,8 @@ class HttpxGeminiClient:
     def __init__(self, api_key: str, base_url: str = GEMINI_BASE_URL, model: str = GEMINI_MODEL, timeout_s: float = 60.0):
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GEMINI_BASE_URL not set.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
