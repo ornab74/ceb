@@ -1,37 +1,4 @@
-"""
-RGN CEB SYSTEM (Color-Entanglement Bits) — META-PROMPT GENERATOR ONLY
-====================================================================
 
-This file is intentionally a "meta-prompt generator":
-- It does NOT embed actual domain countermeasures/runbooks/suggestions.
-- It ONLY builds prompts that instruct an LLM to produce the suggestions/checklists.
-- It keeps the CEB engine + entropy + memory + TUI and can call OpenAI via httpx.
-
-Fix included:
-- Robust psutil sampling in restricted environments where /proc/net/dev is unreadable
-  (PermissionError). net counters fall back to 0 instead of crashing.
-
-Install:
-    pip install numpy psutil httpx
-
-Optional env:
-    export OPENAI_API_KEY="..."
-    export OPENAI_MODEL="gpt-3.5-turbo"
-    export OPENAI_BASE_URL="https://api.openai.com/v1"
-    export RGN_TUI_REFRESH="0.75"
-
-Run:
-    python main.py
-
-Keys:
-    Q quit
-    TAB cycle domain focus
-    P toggle prompt preview
-    O toggle AI output panel
-    R force rescan
-    A run AI for focused domain
-    C toggle colorized view
-"""
 
 from __future__ import annotations
 
