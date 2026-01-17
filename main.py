@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from collections import OrderedDict
 from pathlib import Path
+import importlib.util
 
 import numpy as np
 import psutil
@@ -49,6 +50,14 @@ LLAMA3_AES_KEY_B64 = os.environ.get("LLAMA3_AES_KEY_B64", "")
 MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
 LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
+
+AIOSQLITE_AVAILABLE = importlib.util.find_spec("aiosqlite") is not None
+OQS_AVAILABLE = importlib.util.find_spec("oqs") is not None
+HOMOMORPHIC_AVAILABLE = importlib.util.find_spec("phe") is not None
+if AIOSQLITE_AVAILABLE:
+    import aiosqlite  # type: ignore[import-not-found]
+if HOMOMORPHIC_AVAILABLE:
+    from phe import paillier  # type: ignore[import-not-found]
 BOOK_TITLE = os.environ.get("BOOK_TITLE", os.environ.get("RGN_BOOK_TITLE", "")).strip()
 MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
 AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
@@ -882,6 +891,8 @@ def build_nonnegotiable_rules() -> str:
     return "\n".join([
         "NONNEGOTIABLE RULES:",
         "- Do not claim you have sensors, external data, or certainty.",
+        "- You may use real-time data or simulations only when explicitly provided in USER_CONTEXT or tools output.",
+        "- If real-time data is unavailable, state assumptions and proceed with conservative plans.",
         "- If data is missing: state assumptions + ask targeted questions + still give a lowest-regret plan.",
         "- Avoid fear-mongering; be calm and operational.",
         "- Do not provide illegal instructions.",
@@ -1666,6 +1677,184 @@ def build_user_context_placeholder(domain: str) -> str:
     ])
 
 
+def build_llama_local_playbook() -> str:
+    return "\n".join([
+        "LLAMA LOCAL PLAYBOOK:",
+        "- Use chunk_text_for_longform to split prompts into 3.5–4k char slabs.",
+        "- Track per-chunk outputs and stitch with concat_longform.",
+        "- Verify model SHA256 before loading; prefer encrypted-at-rest storage.",
+        "- Keep a rolling cache of recent prompt plans for local reuse.",
+    ])
+
+
+def homomorphic_generate_keypair() -> Tuple[bytes, bytes]:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    public_key, private_key = paillier.generate_paillier_keypair()  # type: ignore[name-defined]
+    n_bytes = public_key.n.to_bytes(256, "big")
+    p = private_key.p.to_bytes(128, "big")
+    q = private_key.q.to_bytes(128, "big")
+    private_blob = len(p).to_bytes(2, "big") + p + len(q).to_bytes(2, "big") + q
+    return n_bytes, private_blob
+
+
+def homomorphic_encrypt(public_n: bytes, payload: bytes) -> bytes:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    n = int.from_bytes(public_n, "big")
+    public_key = paillier.PaillierPublicKey(n)  # type: ignore[name-defined]
+    data = int.from_bytes(payload or b"\x00", "big")
+    encrypted = public_key.encrypt(data)
+    return encrypted.ciphertext().to_bytes(512, "big")
+
+
+def homomorphic_decrypt(public_n: bytes, private_blob: bytes, ciphertext: bytes) -> bytes:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    n = int.from_bytes(public_n, "big")
+    p_len = int.from_bytes(private_blob[:2], "big")
+    p = int.from_bytes(private_blob[2:2 + p_len], "big")
+    q_len_offset = 2 + p_len
+    q_len = int.from_bytes(private_blob[q_len_offset:q_len_offset + 2], "big")
+    q = int.from_bytes(private_blob[q_len_offset + 2:q_len_offset + 2 + q_len], "big")
+    public_key = paillier.PaillierPublicKey(n)  # type: ignore[name-defined]
+    private_key = paillier.PaillierPrivateKey(public_key, p, q)  # type: ignore[name-defined]
+    enc_value = paillier.EncryptedNumber(public_key, int.from_bytes(ciphertext, "big"))  # type: ignore[name-defined]
+    plain = private_key.decrypt(enc_value)
+    length = max(1, (plain.bit_length() + 7) // 8)
+    return int(plain).to_bytes(length, "big")
+
+
+def colorwheel_encrypt(payload: bytes, rgb: Tuple[int, int, int]) -> bytes:
+    if not payload:
+        return b""
+    key = bytes([(rgb[0] ^ 0xA5), (rgb[1] ^ 0x5A), (rgb[2] ^ 0xC3)])
+    out = bytearray()
+    for i, b in enumerate(payload):
+        out.append(b ^ key[i % len(key)] ^ ((i * 31) & 0xFF))
+    return bytes(out)
+
+
+def colorwheel_decrypt(payload: bytes, rgb: Tuple[int, int, int]) -> bytes:
+    return colorwheel_encrypt(payload, rgb)
+
+
+def secure_delete_file(path: str, passes: int = 2) -> None:
+    target = Path(path)
+    if not target.exists():
+        return
+    size = target.stat().st_size
+    with target.open("r+b") as f:
+        for i in range(int(max(1, passes))):
+            f.seek(0)
+            f.write(secrets.token_bytes(size))
+            f.flush()
+    target.unlink(missing_ok=True)
+
+
+async def kyber_store_init(db_path: str) -> None:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS kyber_snapshots ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "domain TEXT NOT NULL, "
+            "ciphertext BLOB NOT NULL, "
+            "meta_hash TEXT NOT NULL, "
+            "created_at REAL NOT NULL)"
+        )
+        await db.commit()
+
+
+async def kyber_store_snapshot(db_path: str, domain: str, ciphertext: bytes, meta_hash: str) -> None:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO kyber_snapshots (domain, ciphertext, meta_hash, created_at) VALUES (?, ?, ?, ?)",
+            (domain, ciphertext, meta_hash, time.time()),
+        )
+        await db.commit()
+
+
+async def kyber_recollect_by_hash(db_path: str, meta_hash: str) -> List[bytes]:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "SELECT ciphertext FROM kyber_snapshots WHERE meta_hash = ? ORDER BY created_at DESC",
+            (meta_hash,),
+        )
+        rows = await cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+def kyber_generate_keypair() -> Tuple[bytes, bytes]:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        public_key = kem.generate_keypair()
+        private_key = kem.export_secret_key()
+    return public_key, private_key
+
+
+def kyber_encapsulate(public_key: bytes) -> Tuple[bytes, bytes]:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        ciphertext, shared_secret = kem.encap_secret(public_key)
+    return ciphertext, shared_secret
+
+
+def kyber_decapsulate(private_key: bytes, ciphertext: bytes) -> bytes:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        kem.import_secret_key(private_key)
+        shared_secret = kem.decap_secret(ciphertext)
+    return shared_secret
+
+
+def build_advanced_quantum_ai_ideas() -> str:
+    ideas = [
+        "IDEA 01: Quantum Drift Budgeting (cap drift per scan; log exceedances).",
+        "IDEA 02: Coherence Windows (surface plans only when coherence > threshold).",
+        "IDEA 03: Entropy Echo Trails (track recurring entropy signatures).",
+        "IDEA 04: Phase-Stability Alerts (flag abrupt phase deltas).",
+        "IDEA 05: LLM Memory Gate (persist summaries only when confidence high).",
+        "IDEA 06: Memory Distillation Pass (compress short-term into mid-term).",
+        "IDEA 07: Cross-Domain Memory Coupling (propagate drift into linked domains).",
+        "IDEA 08: Volatility Dampener (lower temp when volatility spikes).",
+        "IDEA 09: Risk Laddering (tiered actions by confidence bands).",
+        "IDEA 10: Multi-LLM Consensus (optional compare across providers).",
+        "IDEA 11: Prompt Lineage Tags (hash prompt plan for traceability).",
+        "IDEA 12: Semantic Drift Monitor (flag output divergence vs plan).",
+        "IDEA 13: Entropy Heatmap (track per-domain entropy shifts).",
+        "IDEA 14: Chunk Aging (decay chunk priority over time).",
+        "IDEA 15: Policy Lock (pin nonnegotiable rules during high risk).",
+        "IDEA 16: Memory Shock Ledger (record shock/anomaly events).",
+        "IDEA 17: Adaptive Token Ceiling (set max tokens by coherence).",
+        "IDEA 18: Retrieval Snippets (surface top-3 prior outputs).",
+        "IDEA 19: LLM Latency Guard (skip AI calls if latency spikes).",
+        "IDEA 20: Verification-First Mode (prepend verification steps).",
+        "IDEA 21: Quantum Memory Hashing (store drift signatures as hashes).",
+        "IDEA 22: Adaptive Coherence Floor (auto-raise gates in chaos).",
+        "IDEA 23: Entropy Replay Buffer (re-run plans on prior entropy).",
+        "IDEA 24: Cross-Slice Attribution (map slice shifts to domains).",
+        "IDEA 25: Multi-Provider Blend (weighted provider outputs).",
+        "IDEA 26: Risk-Adjusted Chunk Drop (prune low-weight chunks).",
+        "IDEA 27: Prompt Delta Compression (diff-based prompt updates).",
+        "IDEA 28: Memory Cliff Alerts (notify abrupt memory collapse).",
+        "IDEA 29: Output Consistency Scoring (compare against schema).",
+        "IDEA 30: Verification Trace Links (tie actions to signals).",
+    ]
+    return "ADVANCED QUANTUM + AI + MEMORY IDEAS (30):\n" + "\n".join(f"- {idea}" for idea in ideas)
+
+
 # =============================================================================
 # CEB-BASED CHUNKER (builds meta-prompt)
 # =============================================================================
@@ -1797,6 +1986,9 @@ class CEBChunker:
             ("AGENT_OPERATING_MODEL", agent_operating_model(), 7.3),
             ("HYPOTHESIS_LATTICE", hypothesis_lattice(), 7.2),
             ("RESPONSE_TUNING", response_tuning(), 7.1),
+            ("ADVANCED_IDEAS", build_advanced_quantum_ai_ideas(), 7.35),
+            ("LLAMA_LOCAL_PLAYBOOK", build_llama_local_playbook(), 7.25),
+        ]
         ]
         if domain == "book_generator":
             book_chunks = [
