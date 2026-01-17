@@ -1,37 +1,4 @@
-"""
-RGN CEB SYSTEM (Color-Entanglement Bits) — META-PROMPT GENERATOR ONLY
-====================================================================
 
-This file is intentionally a "meta-prompt generator":
-- It does NOT embed actual domain countermeasures/runbooks/suggestions.
-- It ONLY builds prompts that instruct an LLM to produce the suggestions/checklists.
-- It keeps the CEB engine + entropy + memory + TUI and can call OpenAI via httpx.
-
-Fix included:
-- Robust psutil sampling in restricted environments where /proc/net/dev is unreadable
-  (PermissionError). net counters fall back to 0 instead of crashing.
-
-Install:
-    pip install numpy psutil httpx
-
-Optional env:
-    export OPENAI_API_KEY="..."
-    export OPENAI_MODEL="gpt-3.5-turbo"
-    export OPENAI_BASE_URL="https://api.openai.com/v1"
-    export RGN_TUI_REFRESH="0.75"
-
-Run:
-    python main.py
-
-Keys:
-    Q quit
-    TAB cycle domain focus
-    P toggle prompt preview
-    O toggle AI output panel
-    R force rescan
-    A run AI for focused domain
-    C toggle colorized view
-"""
 
 from __future__ import annotations
 
@@ -91,6 +58,10 @@ if AIOSQLITE_AVAILABLE:
     import aiosqlite  # type: ignore[import-not-found]
 if HOMOMORPHIC_AVAILABLE:
     from phe import paillier  # type: ignore[import-not-found]
+BOOK_TITLE = os.environ.get("BOOK_TITLE", os.environ.get("RGN_BOOK_TITLE", "")).strip()
+MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
+AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
+LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
 
 DEFAULT_DOMAINS = [
     "road_risk",
@@ -99,6 +70,7 @@ DEFAULT_DOMAINS = [
     "medicine_compliance",
     "hygiene",
     "data_security",
+    "book_generator",
 ]
 
 DOMAIN_COUPLING = {
@@ -214,6 +186,12 @@ class SignalPipeline:
         if self.last is None:
             self.last = raw
             self.last_smoothed = raw
+    last_time: float = 0.0
+
+    def update(self, raw: SystemSignals) -> SystemSignals:
+        now = time.time()
+        if self.last is None:
+            self.last = raw
             self.last_time = now
             return raw
 
@@ -234,11 +212,21 @@ class SignalPipeline:
             ram_total=raw.ram_total,
             cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
             disk_percent=ema(prev.disk_percent, raw.disk_percent),
+        smoothed = SystemSignals(
+            ram_used=int(ema(float(prev.ram_used), float(raw.ram_used))),
+            ram_total=raw.ram_total,
+            cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(prev.disk_percent, raw.disk_percent),
+            ram_used=int(ema(float(self.last.ram_used), float(raw.ram_used))),
+            ram_total=raw.ram_total,
+            cpu_percent=ema(self.last.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(self.last.disk_percent, raw.disk_percent),
             net_sent=raw.net_sent,
             net_recv=raw.net_recv,
             uptime_s=raw.uptime_s,
             proc_count=raw.proc_count,
             ram_ratio=float(smoothed_ram_used) / float(raw.ram_total or 1),
+            ram_ratio=float(raw.ram_used) / float(raw.ram_total or 1),
             net_rate=net_rate,
             cpu_jitter=cpu_jitter,
             disk_jitter=disk_jitter,
@@ -575,6 +563,16 @@ class HierarchicalEntropicMemory:
         denom = math.sqrt(short_var) + 1e-6
         self.anomaly_score[domain] = min(6.0, abs(delta) / denom)
         self.last_entropy[domain] = float(entropy)
+
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
 
     def decay(self, factor: float = 0.998) -> None:
         if not (0.0 < factor <= 1.0):
@@ -958,16 +956,718 @@ def build_domain_spec(domain: str) -> str:
             "- Ask for missing: OS/device type, recent alerts, suspicious events, key accounts, backup status.",
             "- Include verification steps: how to confirm accounts/devices are secured after actions.",
         ]
+    elif domain == "book_generator":
+        title_hint = f"TITLE={BOOK_TITLE}" if BOOK_TITLE else "TITLE=<user_provided>"
+        domain_lines = [
+            "DOMAIN SPEC: BOOK_GENERATOR",
+            f"- Input is a single title line. {title_hint}",
+            "- Produce a long-form book draft plan targeting ~200 pages.",
+            "- Aim for exceptional quality, clarity, and narrative cohesion.",
+            "- Include: synopsis, audience, tone, thesis, outline, and chapter-by-chapter beats.",
+            "- Provide a per-chapter word-count budget and progression checkpoints.",
+            "- Ask for only the minimal missing context to refine the draft.",
+            "- Do not claim superiority; focus on measurable craft quality.",
+        ]
     else:
         domain_lines = [f"DOMAIN SPEC: {domain}", "- Produce an operational plan and ask for missing context."]
 
     return "\n".join(common + [""] + domain_lines)
 
 
+def build_book_blueprint() -> str:
+    return "\n".join([
+        "BOOK BLUEPRINT REQUIREMENTS:",
+        "- Produce a 200-page-class blueprint (roughly 60k–90k words) unless the title implies otherwise.",
+        "- Provide a 3-act or 4-part structure with clear thematic through-line.",
+        "- Include: table of contents, chapter titles, chapter intents, and scene-level beats.",
+        "- Add a pacing map: turning points, midpoint shift, climax, and resolution.",
+        "- Provide a style guide: POV, tense, voice, and rhetorical devices to emphasize.",
+        "- Finish with a drafting workflow: milestones, revision passes, and validation checks.",
+    ])
+
+
+def build_book_quality_matrix() -> str:
+    return "\n".join([
+        "BOOK QUALITY MATRIX:",
+        "- Character arcs: list protagonists, flaws, growth beats, and final state.",
+        "- Theme lattice: 3–5 themes with chapter links and evidence beats.",
+        "- Conflict ladder: escalating stakes per act with explicit reversals.",
+        "- Scene checklist: goal, conflict, turning point, and residue for each scene.",
+        "- Voice calibration: 3 sample paragraphs (opening, midpoint, climax) in target voice.",
+    ])
+
+
+def build_book_delivery_spec() -> str:
+    return "\n".join([
+        "BOOK DELIVERY SPEC:",
+        "- Provide a chapter-by-chapter outline with 5–12 bullet beats each.",
+        "- Include a table of key characters, roles, and arc milestones.",
+        "- Provide a glossary of recurring terms and motifs.",
+        "- Add a continuity checklist (names, dates, locations, timeline).",
+        "- Conclude with a 'first 3 chapters' micro-draft plan (scene order + intent).",
+        "- Keep language crisp, craft-focused, and measurable.",
+    ])
+
+
+def build_book_revolutionary_ideas() -> str:
+    ideas = [
+        "IDEA 01: Fractal Theme Braiding (themes repeat at different scales).",
+        "IDEA 02: Echo-Character Ladders (secondary arcs mirror main arc).",
+        "IDEA 03: Tension Harmonics (scene tension frequencies vary per act).",
+        "IDEA 04: Evidence Weaving (motifs prove thesis across chapters).",
+        "IDEA 05: Chronology Drift Maps (time shifts mapped per chapter).",
+        "IDEA 06: Sensory Signature Matrix (recurring sensory cues per arc).",
+        "IDEA 07: Dialogue Resonance Pass (each line advances conflict).",
+        "IDEA 08: Counter-Theme Shadows (explicitly contrast main themes).",
+        "IDEA 09: POV Modulation Curve (POV intensity shifts per act).",
+        "IDEA 10: Scene Energy Ledger (score scenes for momentum).",
+        "IDEA 11: Liminal Chapter Anchors (bridge chapters with micro-tension).",
+        "IDEA 12: Symbolic Payload Budget (symbolic density per chapter).",
+        "IDEA 13: Conflict Topology (plot graph of constraints and escapes).",
+        "IDEA 14: Voice DNA Blueprint (syntax/lexicon/tempo constraints).",
+        "IDEA 15: Paradox Resolution Scaffolding (resolve core paradox).",
+        "IDEA 16: Stakes Cascade Timeline (ramps stakes visibly).",
+        "IDEA 17: Emotional Phase Shifts (planned emotional turning points).",
+        "IDEA 18: Character Pressure Tests (scenes that prove growth).",
+        "IDEA 19: Information Asymmetry Dial (what reader knows vs character).",
+        "IDEA 20: Narrative Compression Maps (tighten slow segments).",
+        "IDEA 21: Scene Purpose Triplets (goal, conflict, reversal).",
+        "IDEA 22: Reward Cadence Planner (payoffs at set intervals).",
+        "IDEA 23: Foreshadowing Trail Map (breadcrumbs with timing).",
+        "IDEA 24: Subplot Load Balancer (subplot timing and weight).",
+        "IDEA 25: Worldbuilding Density Index (detail density per chapter).",
+        "IDEA 26: Thesis Echo Lines (key thesis repeated in varied forms).",
+        "IDEA 27: Character Systems Map (relationships and dependencies).",
+        "IDEA 28: Tone Gradient Scale (tone transition checkpoints).",
+        "IDEA 29: Reader Curiosity Ledger (open loops vs closed loops).",
+        "IDEA 30: Ending Gravity Field (climax arcs converge).",
+    ]
+    return "REVOLUTIONARY IDEAS (30):\n" + "\n".join(f"- {idea}" for idea in ideas)
+
+
+def build_book_review_stack() -> str:
+    return "\n".join([
+        "BOOK REVIEW STACK:",
+        "- Provide a structured review: premise, execution, pacing, voice, and takeaway.",
+        "- Provide a 5-part critique map: strengths, risks, gaps, audience fit, revision priorities.",
+        "- Include a calibration rubric (1–5) for clarity, pacing, originality, cohesion, and emotional impact.",
+        "- End with a revision checklist ordered by highest leverage changes.",
+    ])
+
+
+def build_publishing_polisher() -> str:
+    return "\n".join([
+        "PUBLISHING POLISHER:",
+        "- Provide formatting guidance (chapter headers, subheads, typography notes).",
+        "- Flag consistency errors (names, timelines, pronouns, tense drift).",
+        "- Provide a copy-edit sweep plan: grammar, cadence, redundancy, and specificity.",
+        "- Include a marketability pass: back-cover blurb, logline, and taglines.",
+    ])
+
+
+def build_semantic_clarity_stack() -> str:
+    return "\n".join([
+        "SEMANTIC CLARITY STACK:",
+        "- Identify ambiguous terms and provide replacements with precise alternatives.",
+        "- Provide a clarity ladder: define, demonstrate, reinforce, and recap.",
+        "- Provide a glossary of key terms and narrative anchors.",
+    ])
+
+
+def build_genre_matrix() -> str:
+    return "\n".join([
+        "GENRE MATRIX (adapt output to fit):",
+        "- Fiction: arcs, stakes, reversals, character agency, scene tension.",
+        "- Non-fiction: thesis support, evidence sequencing, argument clarity, summary checkpoints.",
+        "- Children's: age-appropriate language, rhythm, repetition, visual cues.",
+        "- Picture book: page turns, visual beats, minimal text, illustration prompts.",
+        "- Audiobook: spoken cadence, breath spacing, dialogue clarity, sound cues.",
+    ])
+
+
+def build_voice_reading_plan() -> str:
+    return "\n".join([
+        "LONG-FORM VOICE READING PLAN:",
+        "- Provide narration guidance for a human-like reading voice.",
+        "- Use clear sentence cadence, intentional pauses, and chapter transitions.",
+        "- Provide a per-chapter read-aloud note: pace, emphasis, and tone.",
+        "- Include a 'concat + chunk' plan for long outputs to maintain voice consistency.",
+    ])
+
+
+def build_book_revolutionary_ideas_v2() -> str:
+    ideas = [
+        "IDEA 31: Entropix Colorwheel Beats (color-coded tension shifts).",
+        "IDEA 32: CEB Rhythm Pacing (entropy-driven beat spacing).",
+        "IDEA 33: Rotatoe Scene Pivot (rotate POV per act).",
+        "IDEA 34: Semantic Clarity Lattice (clarity targets per chapter).",
+        "IDEA 35: Publishing Polish Loop (draft → polish → verify).",
+        "IDEA 36: Audio Cadence Map (spoken rhythm per chapter).",
+        "IDEA 37: Picturebook Spread Logic (visual pacing grid).",
+        "IDEA 38: Kid-Lexicon Ladder (age-appropriate vocab ramp).",
+        "IDEA 39: Nonfiction Proof Chain (claim → proof → takeaway).",
+        "IDEA 40: Fiction Reversal Clock (reversal timing dial).",
+        "IDEA 41: Theme Echo Harmonics (theme recurrence schedule).",
+        "IDEA 42: Character Orbit Model (relationship gravity map).",
+        "IDEA 43: Beat Density Equalizer (avoid pacing cliffs).",
+        "IDEA 44: Dialogue Clarity Scanner (remove ambiguity).",
+        "IDEA 45: Motif Carryover Index (motifs per act).",
+        "IDEA 46: Audience Expectation Map (genre promise checkpoints).",
+        "IDEA 47: Emotional Gradient Ladder (emotional slope per act).",
+        "IDEA 48: Cliffhanger Calibration (hanger frequency control).",
+        "IDEA 49: Revision Heatmap (priority revisions by impact).",
+        "IDEA 50: Evidence Resonance (nonfiction proof spacing).",
+        "IDEA 51: Voice Consistency Meter (syntax/lexicon alignment).",
+        "IDEA 52: Lore Compression Plan (dense info translated).",
+        "IDEA 53: Micro-scene Efficiency (1–2 beat scenes).",
+        "IDEA 54: Opening Signal Stack (hook, premise, promise).",
+        "IDEA 55: Midpoint Torque (plot torque at midpoint).",
+        "IDEA 56: Ending Convergence Grid (threads resolved).",
+        "IDEA 57: Arc Fail-safe (alternate arc if pivot).",
+        "IDEA 58: Clarity-First Remix (rewrite with simpler syntax).",
+        "IDEA 59: Reader Memory Anchors (recap rhythm).",
+        "IDEA 60: Audio Breathing Marks (spoken pacing cues).",
+    ]
+    return "REVOLUTIONARY IDEAS V2 (30):\n" + "\n".join(f"- {idea}" for idea in ideas)
+
+
+BOOK_REVOLUTION_DEPLOYMENTS_TEXT = """REVOLUTIONARY DEPLOYMENT 01:
+- Core intent: elevate book quality via structured craft controls (1).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 01.01-01.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 01.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 01.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 01.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 01.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 02:
+- Core intent: elevate book quality via structured craft controls (2).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 02.01-02.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 02.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 02.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 02.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 02.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 03:
+- Core intent: elevate book quality via structured craft controls (3).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 03.01-03.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 03.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 03.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 03.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 03.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 04:
+- Core intent: elevate book quality via structured craft controls (4).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 04.01-04.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 04.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 04.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 04.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 04.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 05:
+- Core intent: elevate book quality via structured craft controls (5).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 05.01-05.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 05.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 05.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 05.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 05.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 06:
+- Core intent: elevate book quality via structured craft controls (6).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 06.01-06.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 06.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 06.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 06.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 06.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 07:
+- Core intent: elevate book quality via structured craft controls (7).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 07.01-07.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 07.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 07.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 07.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 07.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 08:
+- Core intent: elevate book quality via structured craft controls (8).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 08.01-08.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 08.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 08.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 08.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 08.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 09:
+- Core intent: elevate book quality via structured craft controls (9).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 09.01-09.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 09.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 09.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 09.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 09.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 10:
+- Core intent: elevate book quality via structured craft controls (10).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 10.01-10.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 10.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 10.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 10.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 10.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 11:
+- Core intent: elevate book quality via structured craft controls (11).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 11.01-11.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 11.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 11.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 11.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 11.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 12:
+- Core intent: elevate book quality via structured craft controls (12).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 12.01-12.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 12.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 12.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 12.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 12.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 13:
+- Core intent: elevate book quality via structured craft controls (13).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 13.01-13.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 13.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 13.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 13.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 13.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 14:
+- Core intent: elevate book quality via structured craft controls (14).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 14.01-14.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 14.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 14.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 14.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 14.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 15:
+- Core intent: elevate book quality via structured craft controls (15).
+- Scope: cover outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 15.01-15.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 15.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 15.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 15.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 15.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map."""
+
+
+def build_book_revolutionary_deployments() -> str:
+    return BOOK_REVOLUTION_DEPLOYMENTS_TEXT.strip()
+
+
+BOOK_REVOLUTION_DEPLOYMENTS_EXTENDED_TEXT = """REVOLUTIONARY DEPLOYMENT 16:
+- Core intent: amplify book quality via structured craft controls (16).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 16.01-16.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 16.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 16.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 16.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 16.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 17:
+- Core intent: amplify book quality via structured craft controls (17).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 17.01-17.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 17.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 17.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 17.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 17.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 18:
+- Core intent: amplify book quality via structured craft controls (18).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 18.01-18.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 18.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 18.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 18.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 18.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 19:
+- Core intent: amplify book quality via structured craft controls (19).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 19.01-19.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 19.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 19.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 19.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 19.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 20:
+- Core intent: amplify book quality via structured craft controls (20).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 20.01-20.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 20.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 20.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 20.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 20.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 21:
+- Core intent: amplify book quality via structured craft controls (21).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 21.01-21.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 21.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 21.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 21.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 21.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 22:
+- Core intent: amplify book quality via structured craft controls (22).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 22.01-22.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 22.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 22.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 22.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 22.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 23:
+- Core intent: amplify book quality via structured craft controls (23).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 23.01-23.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 23.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 23.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 23.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 23.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 24:
+- Core intent: amplify book quality via structured craft controls (24).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 24.01-24.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 24.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 24.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 24.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 24.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 25:
+- Core intent: amplify book quality via structured craft controls (25).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 25.01-25.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 25.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 25.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 25.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 25.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 26:
+- Core intent: amplify book quality via structured craft controls (26).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 26.01-26.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 26.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 26.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 26.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 26.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 27:
+- Core intent: amplify book quality via structured craft controls (27).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 27.01-27.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 27.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 27.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 27.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 27.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 28:
+- Core intent: amplify book quality via structured craft controls (28).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 28.01-28.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 28.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 28.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 28.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 28.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 29:
+- Core intent: amplify book quality via structured craft controls (29).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 29.01-29.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 29.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 29.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 29.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 29.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 30:
+- Core intent: amplify book quality via structured craft controls (30).
+- Scope: expand outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 30.01-30.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 30.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 30.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 30.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 30.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map."""
+
+
+def build_book_revolutionary_deployments_extended() -> str:
+    return BOOK_REVOLUTION_DEPLOYMENTS_EXTENDED_TEXT.strip()
+
+
+BOOK_REVOLUTION_DEPLOYMENTS_SUPER_TEXT = """REVOLUTIONARY DEPLOYMENT 31:
+- Core intent: intensify book quality via structured craft controls (31).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 31.01-31.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 31.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 31.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 31.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 31.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 32:
+- Core intent: intensify book quality via structured craft controls (32).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 32.01-32.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 32.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 32.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 32.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 32.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 33:
+- Core intent: intensify book quality via structured craft controls (33).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 33.01-33.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 33.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 33.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 33.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 33.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 34:
+- Core intent: intensify book quality via structured craft controls (34).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 34.01-34.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 34.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 34.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 34.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 34.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 35:
+- Core intent: intensify book quality via structured craft controls (35).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 35.01-35.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 35.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 35.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 35.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 35.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 36:
+- Core intent: intensify book quality via structured craft controls (36).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 36.01-36.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 36.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 36.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 36.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 36.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 37:
+- Core intent: intensify book quality via structured craft controls (37).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 37.01-37.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 37.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 37.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 37.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 37.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 38:
+- Core intent: intensify book quality via structured craft controls (38).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 38.01-38.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 38.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 38.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 38.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 38.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 39:
+- Core intent: intensify book quality via structured craft controls (39).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 39.01-39.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 39.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 39.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 39.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 39.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 40:
+- Core intent: intensify book quality via structured craft controls (40).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 40.01-40.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 40.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 40.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 40.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 40.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 41:
+- Core intent: intensify book quality via structured craft controls (41).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 41.01-41.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 41.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 41.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 41.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 41.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 42:
+- Core intent: intensify book quality via structured craft controls (42).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 42.01-42.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 42.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 42.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 42.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 42.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 43:
+- Core intent: intensify book quality via structured craft controls (43).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 43.01-43.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 43.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 43.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 43.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 43.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 44:
+- Core intent: intensify book quality via structured craft controls (44).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 44.01-44.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 44.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 44.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 44.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 44.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map.
+
+REVOLUTIONARY DEPLOYMENT 45:
+- Core intent: intensify book quality via structured craft controls (45).
+- Scope: deepen outline, beats, pacing, and revision checkpoints.
+- Output: actionable steps and measurable verification points.
+- Steps 45.01-45.62: Implement craft checkpoints 1–62 with measurable criteria.
+- Step 45.63: Refine craft checkpoint 63 with scene-level validation criteria.
+- Step 45.64: Audit craft checkpoint 64 for continuity and pacing alignment.
+- Step 45.65: Stress-test craft checkpoint 65 against theme and arc coherence.
+- Step 45.66: Finalize craft checkpoint 66 with clarity, cadence, and payoff checks.
+- Verification: confirm alignment with theme, arc, and pacing map."""
+
+
+def build_book_revolutionary_deployments_super() -> str:
+    return BOOK_REVOLUTION_DEPLOYMENTS_SUPER_TEXT.strip()
+
+
+def chunk_text_for_longform(text: str, max_chars: int = 4000) -> List[str]:
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            split = text.rfind("\n", start, end)
+            if split == -1 or split <= start:
+                split = end
+            end = split
+        chunks.append(text[start:end].strip())
+        start = end
+    return [c for c in chunks if c]
+
+
+def concat_longform(chunks: List[str]) -> str:
+    return "\n\n---\n\n".join(chunks).strip()
+
+
 def build_user_context_placeholder(domain: str) -> str:
+    title_line = f"- title: {BOOK_TITLE}" if domain == "book_generator" and BOOK_TITLE else "- title:"
     return "\n".join([
         "USER_CONTEXT (fill this in; if empty, ask questions):",
         f"- domain={domain}",
+        title_line,
         "- goal:",
         "- constraints:",
         "- timeline:",
@@ -1289,6 +1989,25 @@ class CEBChunker:
             ("ADVANCED_IDEAS", build_advanced_quantum_ai_ideas(), 7.35),
             ("LLAMA_LOCAL_PLAYBOOK", build_llama_local_playbook(), 7.25),
         ]
+        ]
+        if domain == "book_generator":
+            book_chunks = [
+                ("BOOK_BLUEPRINT", build_book_blueprint(), 8.5),
+                ("BOOK_QUALITY_MATRIX", build_book_quality_matrix(), 8.3),
+                ("BOOK_DELIVERY_SPEC", build_book_delivery_spec(), 8.2),
+                ("REVOLUTIONARY_IDEAS", build_book_revolutionary_ideas(), 8.1),
+                ("REVOLUTIONARY_IDEAS_V2", build_book_revolutionary_ideas_v2(), 8.05),
+                ("BOOK_REVIEW_STACK", build_book_review_stack(), 8.0),
+                ("PUBLISHING_POLISHER", build_publishing_polisher(), 7.95),
+                ("SEMANTIC_CLARITY", build_semantic_clarity_stack(), 7.9),
+                ("GENRE_MATRIX", build_genre_matrix(), 7.85),
+                ("VOICE_READING_PLAN", build_voice_reading_plan(), 7.8),
+                ("REVOLUTIONARY_DEPLOYMENTS", build_book_revolutionary_deployments(), 8.0),
+                ("REVOLUTIONARY_DEPLOYMENTS_EXT", build_book_revolutionary_deployments_extended(), 7.95),
+                ("REVOLUTIONARY_DEPLOYMENTS_SUPER", build_book_revolutionary_deployments_super(), 7.9),
+            ]
+            optional_chunks.extend(book_chunks)
+
         if risk >= 0.66 or quantum_gain >= 0.7:
             optional_chunks.append((
                 "CONTAINMENT_PRIORITY",
@@ -1506,6 +2225,7 @@ class HttpxOpenAIClient:
         payload = {
             "model": self.model,
             "input": prompt,
+            "input": [{"role": "user", "content": prompt}],
             "temperature": float(temperature),
             "max_output_tokens": int(max_tokens),
             "store": False,
@@ -1540,6 +2260,11 @@ class HttpxOpenAIClient:
                 t = part.get("text")
                 if isinstance(t, str) and t.strip():
                     texts.append(t)
+            if item.get("type") == "message":
+                for part in item.get("content", []) or []:
+                    t = part.get("text")
+                    if isinstance(t, str) and t.strip():
+                        texts.append(t)
         return "\n".join(texts).strip()
 
     def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
@@ -1557,6 +2282,144 @@ class HttpxGrokClient:
             raise RuntimeError("GROK_API_KEY not set.")
         if not base_url:
             raise RuntimeError("GROK_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, headers=headers, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["choices"][0]["message"]["content"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Grok call failed: {last_err}")
+
+
+class HttpxGeminiClient:
+    def __init__(self, api_key: str, base_url: str = GEMINI_BASE_URL, model: str = GEMINI_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GEMINI_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Gemini call failed: {last_err}")
+
+
+def download_llama3_model(target_path: str) -> None:
+    if not LLAMA3_MODEL_URL or not LLAMA3_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_MODEL_URL or LLAMA3_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3 model hash mismatch.")
+
+
+def download_llama3_2_model(target_path: str) -> None:
+    if not LLAMA3_2_MODEL_URL or not LLAMA3_2_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_2_MODEL_URL or LLAMA3_2_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_2_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_2_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3.2 model hash mismatch.")
+
+
+def encrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    data = Path(src_path).read_bytes()
+    encrypted = aesgcm.encrypt(nonce, data, None)
+    Path(dst_path).write_bytes(nonce + encrypted)
+
+
+def decrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    blob = Path(src_path).read_bytes()
+    nonce = blob[:12]
+    data = blob[12:]
+    decrypted = aesgcm.decrypt(nonce, data, None)
+    Path(dst_path).write_bytes(decrypted)
+
+    def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        chunks = chunk_text_for_longform(prompt, max_chars=3800)
+        outputs = []
+        for idx, chunk in enumerate(chunks, start=1):
+            header = f"[CHUNK {idx}/{len(chunks)}]\n"
+            outputs.append(self.chat(header + chunk, temperature=temperature, max_tokens=max_tokens, retries=retries))
+        return concat_longform(outputs)
+
+
+class HttpxGrokClient:
+    def __init__(self, api_key: str, base_url: str = GROK_BASE_URL, model: str = GROK_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GROK_API_KEY not set.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -1772,6 +2635,9 @@ class RGNCebSystem:
                 "shock": float(shock),
                 "anomaly": float(anomaly),
             }
+            status = status_from_risk(risk)
+
+            metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
             quantum_summary = build_quantum_advancements(signals, sig, metrics, loops=5)
             metrics["quantum_gain"] = float(quantum_summary.get("quantum_gain", 0.0))
             metrics["quantum_summary"] = quantum_summary
@@ -2186,7 +3052,11 @@ def strip_rgb_tags(prompt: str) -> str:
 # MAIN
 # =============================================================================
 def main() -> None:
-    sys = RGNCebSystem(domains=DEFAULT_DOMAINS)
+    domains = DEFAULT_DOMAINS
+    if BOOK_TITLE:
+        # When a book title is provided, focus on the book generator domain.
+        domains = ["book_generator"]
+    sys = RGNCebSystem(domains=domains)
     tui = AdvancedTUI(sys)
     tui.run()
 
