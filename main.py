@@ -48,6 +48,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from collections import OrderedDict
+from pathlib import Path
+import importlib.util
 
 import numpy as np
 import psutil
@@ -65,8 +67,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # CONSTANTS
 # =============================================================================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-2")
+GROK_BASE_URL = os.environ.get("GROK_BASE_URL", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-pro")
+GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "").strip()
+LLAMA3_MODEL_URL = os.environ.get("LLAMA3_MODEL_URL", "")
+LLAMA3_MODEL_SHA256 = os.environ.get("LLAMA3_MODEL_SHA256", "")
+LLAMA3_2_MODEL_URL = os.environ.get("LLAMA3_2_MODEL_URL", "")
+LLAMA3_2_MODEL_SHA256 = os.environ.get("LLAMA3_2_MODEL_SHA256", "")
+LLAMA3_AES_KEY_B64 = os.environ.get("LLAMA3_AES_KEY_B64", "")
+MAX_PROMPT_CHARS = int(os.environ.get("RGN_MAX_PROMPT_CHARS", "22000"))
+AI_COOLDOWN_SECONDS = float(os.environ.get("RGN_AI_COOLDOWN", "30"))
+LOG_BUFFER_LINES = int(os.environ.get("RGN_LOG_LINES", "160"))
+
+AIOSQLITE_AVAILABLE = importlib.util.find_spec("aiosqlite") is not None
+OQS_AVAILABLE = importlib.util.find_spec("oqs") is not None
+HOMOMORPHIC_AVAILABLE = importlib.util.find_spec("phe") is not None
+if AIOSQLITE_AVAILABLE:
+    import aiosqlite  # type: ignore[import-not-found]
+if HOMOMORPHIC_AVAILABLE:
+    from phe import paillier  # type: ignore[import-not-found]
 
 DEFAULT_DOMAINS = [
     "road_risk",
@@ -103,10 +127,17 @@ class SystemSignals:
     net_recv: int
     uptime_s: float
     proc_count: int
+    ram_ratio: float = 0.0
+    net_rate: float = 0.0
+    cpu_jitter: float = 0.0
+    disk_jitter: float = 0.0
 
     @staticmethod
     def sample() -> "SystemSignals":
         # Robust sampling: handle sandboxes/containers where /proc/* may be unreadable.
+        # This is intentionally defensive, returning zeros when any probe fails so
+        # the rest of the pipeline (entropy, CEB evolution, TUI) can keep running
+        # without collapsing due to restricted metrics access.
         vm_used = 0
         vm_total = 1
         cpu = 0.0
@@ -161,15 +192,89 @@ class SystemSignals:
             net_recv=net_recv,
             uptime_s=uptime,
             proc_count=procs,
+            ram_ratio=float(vm_used) / float(vm_total or 1),
+            net_rate=0.0,
+            cpu_jitter=0.0,
+            disk_jitter=0.0,
         )
+
+
+@dataclass
+class SignalPipeline:
+    alpha: float = 0.22
+    last: Optional[SystemSignals] = None
+    last_smoothed: Optional[SystemSignals] = None
+    last_time: float = 0.0
+
+    def update(self, raw: SystemSignals) -> SystemSignals:
+        # Smooth input signals with a lightweight EMA and derive delta-based
+        # metrics (net_rate, jitter). This trades a little latency for a big
+        # reduction in noisy spikes that can destabilize downstream prompts.
+        now = time.time()
+        if self.last is None:
+            self.last = raw
+            self.last_smoothed = raw
+            self.last_time = now
+            return raw
+
+        dt = max(0.05, now - self.last_time)
+        net_delta = (raw.net_sent - self.last.net_sent) + (raw.net_recv - self.last.net_recv)
+        net_rate = float(net_delta) / dt
+        cpu_jitter = abs(raw.cpu_percent - self.last.cpu_percent)
+        disk_jitter = abs(raw.disk_percent - self.last.disk_percent)
+
+        prev = self.last_smoothed or self.last
+
+        def ema(prev: float, cur: float) -> float:
+            return (1.0 - self.alpha) * prev + self.alpha * cur
+
+        smoothed_ram_used = int(ema(float(prev.ram_used), float(raw.ram_used)))
+        smoothed = SystemSignals(
+            ram_used=smoothed_ram_used,
+            ram_total=raw.ram_total,
+            cpu_percent=ema(prev.cpu_percent, raw.cpu_percent),
+            disk_percent=ema(prev.disk_percent, raw.disk_percent),
+            net_sent=raw.net_sent,
+            net_recv=raw.net_recv,
+            uptime_s=raw.uptime_s,
+            proc_count=raw.proc_count,
+            ram_ratio=float(smoothed_ram_used) / float(raw.ram_total or 1),
+            net_rate=net_rate,
+            cpu_jitter=cpu_jitter,
+            disk_jitter=disk_jitter,
+        )
+
+        self.last = raw
+        self.last_smoothed = smoothed
+        self.last_time = now
+        return smoothed
 
 
 # =============================================================================
 # RGB ENTROPY + LATTICE
 # =============================================================================
 def rgb_entropy_wheel(signals: SystemSignals) -> np.ndarray:
+    # Generate a compact RGB seed that fuses instantaneous signals, jitter,
+    # and uptime into a phase. The seed is intentionally lossy: we want a
+    # chaotic-but-stable entropy anchor rather than a raw telemetry dump.
     t = time.perf_counter_ns()
-    phase = (t ^ int(signals.cpu_percent * 1e6) ^ signals.ram_used ^ signals.net_sent ^ signals.net_recv) & 0xFFFFFFFF
+    uptime_bits = int(signals.uptime_s * 1e6)
+    proc_bits = int(signals.proc_count)
+    disk_bits = int(signals.disk_percent * 1000)
+    net_rate_bits = int(abs(signals.net_rate)) & 0xFFFFFFFF
+    jitter_bits = int((signals.cpu_jitter + signals.disk_jitter) * 1000)
+    phase = (
+        t
+        ^ int(signals.cpu_percent * 1e6)
+        ^ signals.ram_used
+        ^ signals.net_sent
+        ^ signals.net_recv
+        ^ uptime_bits
+        ^ proc_bits
+        ^ disk_bits
+        ^ net_rate_bits
+        ^ jitter_bits
+    ) & 0xFFFFFFFF
     r = int((math.sin(phase * 1e-9) + 1.0) * 127.5) ^ secrets.randbits(8)
     g = int((math.sin(phase * 1e-9 + 2.09439510239) + 1.0) * 127.5) ^ secrets.randbits(8)
     b = int((math.sin(phase * 1e-9 + 4.18879020479) + 1.0) * 127.5) ^ secrets.randbits(8)
@@ -182,12 +287,20 @@ def rgb_quantum_lattice(signals: SystemSignals) -> np.ndarray:
     - fuse base bytes with entropy RGB via add + xor (uint8)
     - convert to normalized float vector in [-1,1] then normalize
     """
+    # The lattice is a normalized vector that acts like a "phase space"
+    # background for the CEB evolution. It is derived from signal bytes
+    # plus a hint of randomness to avoid deterministic lock-in.
     rgb = rgb_entropy_wheel(signals).astype(np.uint8)
 
     t = time.perf_counter_ns()
     cpu = signals.cpu_percent
     ram = signals.ram_used
     net = signals.net_sent ^ signals.net_recv
+    uptime = int(signals.uptime_s * 1e6)
+    proc = int(signals.proc_count)
+    disk = int(signals.disk_percent * 1000)
+    net_rate = int(abs(signals.net_rate))
+    jitter = int((signals.cpu_jitter + signals.disk_jitter) * 1000)
 
     base_u8 = np.array(
         [
@@ -196,6 +309,16 @@ def rgb_quantum_lattice(signals: SystemSignals) -> np.ndarray:
             (net >> 0) & 0xFF, (net >> 8) & 0xFF,
             int(cpu * 10) & 0xFF,
             int((ram % 10_000_000) / 1000) & 0xFF,
+            (uptime >> 0) & 0xFF,
+            (uptime >> 8) & 0xFF,
+            (proc >> 0) & 0xFF,
+            (proc >> 8) & 0xFF,
+            (disk >> 0) & 0xFF,
+            (disk >> 8) & 0xFF,
+            (net_rate >> 0) & 0xFF,
+            (net_rate >> 8) & 0xFF,
+            (jitter >> 0) & 0xFF,
+            (jitter >> 8) & 0xFF,
         ],
         dtype=np.uint8,
     )
@@ -223,6 +346,11 @@ def amplify_entropy(signals: SystemSignals, lattice: np.ndarray) -> bytes:
     blob += int(signals.disk_percent * 1000).to_bytes(8, "little", signed=False)
     blob += int(signals.net_sent).to_bytes(8, "little", signed=False)
     blob += int(signals.net_recv).to_bytes(8, "little", signed=False)
+    blob += int(signals.uptime_s * 1000).to_bytes(8, "little", signed=False)
+    blob += int(signals.proc_count).to_bytes(8, "little", signed=False)
+    blob += int(signals.net_rate).to_bytes(8, "little", signed=True)
+    blob += int(signals.cpu_jitter * 1000).to_bytes(8, "little", signed=False)
+    blob += int(signals.disk_jitter * 1000).to_bytes(8, "little", signed=False)
     return hashlib.sha3_512(blob).digest()
 
 
@@ -230,6 +358,59 @@ def shannon_entropy(prob: np.ndarray) -> float:
     p = np.clip(prob.astype(np.float64), 1e-12, 1.0)
     return float(-np.sum(p * np.log2(p)))
 
+
+# =============================================================================
+# QUANTUM ADVANCEMENTS (iterative multi-idea loops)
+# =============================================================================
+def _quantum_loop_metrics(seed: float, idx: int) -> Dict[str, float]:
+    phase = math.sin(seed + idx * 0.77) * 0.5 + 0.5
+    coherence = (math.cos(seed * 0.9 + idx * 0.41) * 0.5 + 0.5)
+    resonance = (phase * 0.6 + coherence * 0.4)
+    return {
+        "phase_lock": float(np.clip(phase, 0.0, 1.0)),
+        "coherence": float(np.clip(coherence, 0.0, 1.0)),
+        "resonance": float(np.clip(resonance, 0.0, 1.0)),
+    }
+
+
+def build_quantum_advancements(
+    signals: SystemSignals,
+    ceb_sig: Dict[str, Any],
+    metrics: Dict[str, float],
+    loops: int = 5,
+) -> Dict[str, Any]:
+    base_seed = (
+        (signals.cpu_percent * 0.07)
+        + (signals.disk_percent * 0.05)
+        + (signals.ram_ratio * 1.3)
+        + (signals.net_rate * 1e-6)
+        + (signals.cpu_jitter + signals.disk_jitter) * 0.2
+        + (metrics.get("drift", 0.0) * 2.2)
+    )
+    entropy = float(ceb_sig.get("entropy", 0.0))
+    loops_out = []
+    gain = 0.0
+    for i in range(int(loops)):
+        seed = base_seed + entropy * 0.11 + i * 0.9
+        base = _quantum_loop_metrics(seed, i)
+        drift_gate = 0.35 + 0.65 * abs(math.sin(seed * 0.33 + i * 0.19))
+        derived = {
+            "drift_gate": float(np.clip(drift_gate, 0.0, 1.0)),
+            "entanglement_bias": float(np.clip(base["resonance"] * (0.7 + 0.3 * base["coherence"]), 0.0, 1.0)),
+            "holo_drift": float(np.clip(drift_gate * (0.55 + 0.45 * abs(metrics.get("drift", 0.0))), 0.0, 1.0)),
+            "phase_stability": float(np.clip(1.0 - abs(base["phase_lock"] - base["coherence"]), 0.0, 1.0)),
+            "prompt_pressure": float(np.clip((entropy / 6.0) * (0.6 + 0.4 * base["resonance"]), 0.0, 1.0)),
+        }
+        loop_gain = 0.45 * base["resonance"] + 0.35 * derived["phase_stability"] + 0.20 * derived["prompt_pressure"]
+        gain += loop_gain
+        loops_out.append({"base": base, "derived": derived, "loop_gain": float(np.clip(loop_gain, 0.0, 1.0))})
+
+    quantum_gain = float(np.clip(gain / max(1.0, loops), 0.0, 1.0))
+    return {
+        "loops": loops_out,
+        "quantum_gain": quantum_gain,
+        "entropy": entropy,
+    }
 
 # =============================================================================
 # CEBs (Color-Entanglement Bits)
@@ -290,6 +471,10 @@ class CEBEngine:
         drift_bias: float = 0.0,
         chroma_gain: float = 1.0,
     ) -> CEBState:
+        # The evolve step advances amplitudes and colors through a coupled
+        # non-linear system. It uses entropy to modulate phase, lattice
+        # coupling, and chroma rotation. The goal is a rich probability
+        # distribution rather than a single dominant peak.
         drift_bias = float(np.clip(drift_bias, -0.75, 0.75))
         amps = st.amps.copy()
         colors = st.colors.copy()
@@ -364,8 +549,13 @@ class HierarchicalEntropicMemory:
         self.short: Dict[str, List[float]] = {}
         self.mid: Dict[str, List[float]] = {}
         self.long: Dict[str, float] = {}
+        self.last_entropy: Dict[str, float] = {}
+        self.shock_ema: Dict[str, float] = {}
+        self.anomaly_score: Dict[str, float] = {}
 
     def update(self, domain: str, entropy: float) -> None:
+        # Maintain multi-horizon traces (short/mid/long) and compute
+        # shock/anomaly signals based on delta relative to recent variance.
         self.short.setdefault(domain, []).append(float(entropy))
         self.mid.setdefault(domain, []).append(float(entropy))
         self.short[domain] = self.short[domain][-self.short_n:]
@@ -376,6 +566,25 @@ class HierarchicalEntropicMemory:
             b = self.long[domain]
             a = self.baseline_alpha
             self.long[domain] = (1.0 - a) * b + a * float(entropy)
+        prev = self.last_entropy.get(domain, float(entropy))
+        delta = float(entropy) - prev
+        shock_prev = self.shock_ema.get(domain, 0.0)
+        shock_now = 0.85 * shock_prev + 0.15 * abs(delta)
+        self.shock_ema[domain] = shock_now
+        short_var = float(np.var(self.short[domain])) if len(self.short[domain]) >= 2 else 0.0
+        denom = math.sqrt(short_var) + 1e-6
+        self.anomaly_score[domain] = min(6.0, abs(delta) / denom)
+        self.last_entropy[domain] = float(entropy)
+
+    def decay(self, factor: float = 0.998) -> None:
+        if not (0.0 < factor <= 1.0):
+            return
+        for domain, series in list(self.short.items()):
+            self.short[domain] = [v * factor for v in series]
+        for domain, series in list(self.mid.items()):
+            self.mid[domain] = [v * factor for v in series]
+        for domain in list(self.long.keys()):
+            self.long[domain] = self.long[domain] * factor
 
     def stats(self, domain: str) -> Dict[str, float]:
         s = self.short.get(domain, [])
@@ -392,10 +601,30 @@ class HierarchicalEntropicMemory:
         st = self.stats(domain)
         return float(st["short_mean"] - st["baseline"])
 
+    def weighted_drift(self, domain: str, w_short: float = 0.6, w_mid: float = 0.3, w_long: float = 0.1) -> float:
+        # Blend short/mid/long signals into a single drift value, then
+        # compare back to the long baseline to maintain a stable center.
+        st = self.stats(domain)
+        total = w_short + w_mid + w_long
+        if total <= 0:
+            return 0.0
+        blend = (
+            (w_short / total) * st["short_mean"]
+            + (w_mid / total) * st["mid_mean"]
+            + (w_long / total) * st["baseline"]
+        )
+        return float(blend - st["baseline"])
+
     def confidence(self, domain: str) -> float:
         st = self.stats(domain)
         conf = 1.0 / (1.0 + st["volatility"])
         return float(max(0.1, min(0.99, conf)))
+
+    def shock(self, domain: str) -> float:
+        return float(self.shock_ema.get(domain, 0.0))
+
+    def anomaly(self, domain: str) -> float:
+        return float(self.anomaly_score.get(domain, 0.0))
 
 
 # =============================================================================
@@ -445,6 +674,22 @@ def apply_cross_domain_bias(domain: str, base_risk: float, memory: HierarchicalE
         if d > 0:
             bias += min(0.12, d * 0.06)
     return float(np.clip(base_risk + bias, 0.0, 1.0))
+
+
+def adjust_risk_by_confidence(base_risk: float, confidence: float, volatility: float) -> float:
+    conf = float(np.clip(confidence, 0.1, 0.99))
+    vol = float(np.clip(volatility, 0.0, 1.0))
+    damp = 0.70 + 0.30 * conf
+    vol_tilt = 1.0 + 0.15 * vol
+    adjusted = base_risk * damp * vol_tilt
+    return float(np.clip(adjusted, 0.0, 1.0))
+
+
+def adjust_risk_by_instability(base_risk: float, shock: float, anomaly: float) -> float:
+    shock_level = float(np.clip(shock * 1.8, 0.0, 1.0))
+    anomaly_level = float(np.clip(anomaly / 6.0, 0.0, 1.0))
+    lift = 0.10 * shock_level + 0.08 * anomaly_level
+    return float(np.clip(base_risk + lift, 0.0, 1.0))
 
 
 def status_from_risk(r: float) -> str:
@@ -648,6 +893,8 @@ def build_nonnegotiable_rules() -> str:
     return "\n".join([
         "NONNEGOTIABLE RULES:",
         "- Do not claim you have sensors, external data, or certainty.",
+        "- You may use real-time data or simulations only when explicitly provided in USER_CONTEXT or tools output.",
+        "- If real-time data is unavailable, state assumptions and proceed with conservative plans.",
         "- If data is missing: state assumptions + ask targeted questions + still give a lowest-regret plan.",
         "- Avoid fear-mongering; be calm and operational.",
         "- Do not provide illegal instructions.",
@@ -730,6 +977,184 @@ def build_user_context_placeholder(domain: str) -> str:
     ])
 
 
+def build_llama_local_playbook() -> str:
+    return "\n".join([
+        "LLAMA LOCAL PLAYBOOK:",
+        "- Use chunk_text_for_longform to split prompts into 3.5–4k char slabs.",
+        "- Track per-chunk outputs and stitch with concat_longform.",
+        "- Verify model SHA256 before loading; prefer encrypted-at-rest storage.",
+        "- Keep a rolling cache of recent prompt plans for local reuse.",
+    ])
+
+
+def homomorphic_generate_keypair() -> Tuple[bytes, bytes]:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    public_key, private_key = paillier.generate_paillier_keypair()  # type: ignore[name-defined]
+    n_bytes = public_key.n.to_bytes(256, "big")
+    p = private_key.p.to_bytes(128, "big")
+    q = private_key.q.to_bytes(128, "big")
+    private_blob = len(p).to_bytes(2, "big") + p + len(q).to_bytes(2, "big") + q
+    return n_bytes, private_blob
+
+
+def homomorphic_encrypt(public_n: bytes, payload: bytes) -> bytes:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    n = int.from_bytes(public_n, "big")
+    public_key = paillier.PaillierPublicKey(n)  # type: ignore[name-defined]
+    data = int.from_bytes(payload or b"\x00", "big")
+    encrypted = public_key.encrypt(data)
+    return encrypted.ciphertext().to_bytes(512, "big")
+
+
+def homomorphic_decrypt(public_n: bytes, private_blob: bytes, ciphertext: bytes) -> bytes:
+    if not HOMOMORPHIC_AVAILABLE:
+        raise RuntimeError("phe (paillier) not available.")
+    n = int.from_bytes(public_n, "big")
+    p_len = int.from_bytes(private_blob[:2], "big")
+    p = int.from_bytes(private_blob[2:2 + p_len], "big")
+    q_len_offset = 2 + p_len
+    q_len = int.from_bytes(private_blob[q_len_offset:q_len_offset + 2], "big")
+    q = int.from_bytes(private_blob[q_len_offset + 2:q_len_offset + 2 + q_len], "big")
+    public_key = paillier.PaillierPublicKey(n)  # type: ignore[name-defined]
+    private_key = paillier.PaillierPrivateKey(public_key, p, q)  # type: ignore[name-defined]
+    enc_value = paillier.EncryptedNumber(public_key, int.from_bytes(ciphertext, "big"))  # type: ignore[name-defined]
+    plain = private_key.decrypt(enc_value)
+    length = max(1, (plain.bit_length() + 7) // 8)
+    return int(plain).to_bytes(length, "big")
+
+
+def colorwheel_encrypt(payload: bytes, rgb: Tuple[int, int, int]) -> bytes:
+    if not payload:
+        return b""
+    key = bytes([(rgb[0] ^ 0xA5), (rgb[1] ^ 0x5A), (rgb[2] ^ 0xC3)])
+    out = bytearray()
+    for i, b in enumerate(payload):
+        out.append(b ^ key[i % len(key)] ^ ((i * 31) & 0xFF))
+    return bytes(out)
+
+
+def colorwheel_decrypt(payload: bytes, rgb: Tuple[int, int, int]) -> bytes:
+    return colorwheel_encrypt(payload, rgb)
+
+
+def secure_delete_file(path: str, passes: int = 2) -> None:
+    target = Path(path)
+    if not target.exists():
+        return
+    size = target.stat().st_size
+    with target.open("r+b") as f:
+        for i in range(int(max(1, passes))):
+            f.seek(0)
+            f.write(secrets.token_bytes(size))
+            f.flush()
+    target.unlink(missing_ok=True)
+
+
+async def kyber_store_init(db_path: str) -> None:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS kyber_snapshots ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "domain TEXT NOT NULL, "
+            "ciphertext BLOB NOT NULL, "
+            "meta_hash TEXT NOT NULL, "
+            "created_at REAL NOT NULL)"
+        )
+        await db.commit()
+
+
+async def kyber_store_snapshot(db_path: str, domain: str, ciphertext: bytes, meta_hash: str) -> None:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO kyber_snapshots (domain, ciphertext, meta_hash, created_at) VALUES (?, ?, ?, ?)",
+            (domain, ciphertext, meta_hash, time.time()),
+        )
+        await db.commit()
+
+
+async def kyber_recollect_by_hash(db_path: str, meta_hash: str) -> List[bytes]:
+    if not AIOSQLITE_AVAILABLE:
+        raise RuntimeError("aiosqlite not available.")
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "SELECT ciphertext FROM kyber_snapshots WHERE meta_hash = ? ORDER BY created_at DESC",
+            (meta_hash,),
+        )
+        rows = await cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+def kyber_generate_keypair() -> Tuple[bytes, bytes]:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        public_key = kem.generate_keypair()
+        private_key = kem.export_secret_key()
+    return public_key, private_key
+
+
+def kyber_encapsulate(public_key: bytes) -> Tuple[bytes, bytes]:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        ciphertext, shared_secret = kem.encap_secret(public_key)
+    return ciphertext, shared_secret
+
+
+def kyber_decapsulate(private_key: bytes, ciphertext: bytes) -> bytes:
+    if not OQS_AVAILABLE:
+        raise RuntimeError("oqs not available.")
+    import oqs  # type: ignore[import-not-found]
+    with oqs.KeyEncapsulation("Kyber512") as kem:
+        kem.import_secret_key(private_key)
+        shared_secret = kem.decap_secret(ciphertext)
+    return shared_secret
+
+
+def build_advanced_quantum_ai_ideas() -> str:
+    ideas = [
+        "IDEA 01: Quantum Drift Budgeting (cap drift per scan; log exceedances).",
+        "IDEA 02: Coherence Windows (surface plans only when coherence > threshold).",
+        "IDEA 03: Entropy Echo Trails (track recurring entropy signatures).",
+        "IDEA 04: Phase-Stability Alerts (flag abrupt phase deltas).",
+        "IDEA 05: LLM Memory Gate (persist summaries only when confidence high).",
+        "IDEA 06: Memory Distillation Pass (compress short-term into mid-term).",
+        "IDEA 07: Cross-Domain Memory Coupling (propagate drift into linked domains).",
+        "IDEA 08: Volatility Dampener (lower temp when volatility spikes).",
+        "IDEA 09: Risk Laddering (tiered actions by confidence bands).",
+        "IDEA 10: Multi-LLM Consensus (optional compare across providers).",
+        "IDEA 11: Prompt Lineage Tags (hash prompt plan for traceability).",
+        "IDEA 12: Semantic Drift Monitor (flag output divergence vs plan).",
+        "IDEA 13: Entropy Heatmap (track per-domain entropy shifts).",
+        "IDEA 14: Chunk Aging (decay chunk priority over time).",
+        "IDEA 15: Policy Lock (pin nonnegotiable rules during high risk).",
+        "IDEA 16: Memory Shock Ledger (record shock/anomaly events).",
+        "IDEA 17: Adaptive Token Ceiling (set max tokens by coherence).",
+        "IDEA 18: Retrieval Snippets (surface top-3 prior outputs).",
+        "IDEA 19: LLM Latency Guard (skip AI calls if latency spikes).",
+        "IDEA 20: Verification-First Mode (prepend verification steps).",
+        "IDEA 21: Quantum Memory Hashing (store drift signatures as hashes).",
+        "IDEA 22: Adaptive Coherence Floor (auto-raise gates in chaos).",
+        "IDEA 23: Entropy Replay Buffer (re-run plans on prior entropy).",
+        "IDEA 24: Cross-Slice Attribution (map slice shifts to domains).",
+        "IDEA 25: Multi-Provider Blend (weighted provider outputs).",
+        "IDEA 26: Risk-Adjusted Chunk Drop (prune low-weight chunks).",
+        "IDEA 27: Prompt Delta Compression (diff-based prompt updates).",
+        "IDEA 28: Memory Cliff Alerts (notify abrupt memory collapse).",
+        "IDEA 29: Output Consistency Scoring (compare against schema).",
+        "IDEA 30: Verification Trace Links (tie actions to signals).",
+    ]
+    return "ADVANCED QUANTUM + AI + MEMORY IDEAS (30):\n" + "\n".join(f"- {idea}" for idea in ideas)
+
+
 # =============================================================================
 # CEB-BASED CHUNKER (builds meta-prompt)
 # =============================================================================
@@ -737,9 +1162,23 @@ class CEBChunker:
     def __init__(self, max_chunks: int = 14):
         self.max_chunks = int(max_chunks)
 
-    def build(self, domain: str, metrics: Dict[str, float], ceb_sig: Dict[str, Any], base_rgb: np.ndarray) -> List[PromptChunk]:
+    def build(
+        self,
+        domain: str,
+        metrics: Dict[str, float],
+        ceb_sig: Dict[str, Any],
+        base_rgb: np.ndarray,
+        signal_summary: Optional[Dict[str, Any]] = None,
+    ) -> List[PromptChunk]:
+        # Build a prioritized list of prompt chunks. Required chunks anchor
+        # structure; optional chunks add advanced guidance based on quantum
+        # gain, risk, and uncertainty. This keeps prompts adaptive without
+        # exploding length.
         top = ceb_sig.get("top", [])
         ent = float(ceb_sig.get("entropy", 0.0))
+        quantum = metrics.get("quantum_summary", {})
+        quantum_gain = float(quantum.get("quantum_gain", 0.0))
+        signal_summary = signal_summary or {}
 
         def pick_rgb(i: int) -> Tuple[int, int, int]:
             if top:
@@ -755,7 +1194,64 @@ class CEBChunker:
         conf = float(metrics["confidence"])
         vol = float(metrics["volatility"])
 
-        chunks: List[Tuple[str, str, float]] = [
+        def signal_telemetry() -> str:
+            if not signal_summary:
+                return "SIGNAL TELEMETRY: (no live signal summary available)"
+            lines = [
+                "SIGNAL TELEMETRY (summary only; do not treat as ground truth):",
+                f"- cpu={signal_summary.get('cpu', 'n/a')}%",
+                f"- disk={signal_summary.get('disk', 'n/a')}%",
+                f"- ram_ratio={signal_summary.get('ram_ratio', 'n/a')}",
+                f"- net_rate={signal_summary.get('net_rate', 'n/a')} B/s",
+                f"- uptime_s={signal_summary.get('uptime_s', 'n/a')}",
+                f"- proc={signal_summary.get('proc', 'n/a')}",
+                f"- jitter={signal_summary.get('jitter', 'n/a')}",
+                f"- quantum_gain={signal_summary.get('quantum_gain', 'n/a')}",
+            ]
+            return "\n".join(lines)
+
+        def quantum_projection() -> str:
+            summary = quantum.get("loops", [])
+            if not summary:
+                return "QUANTUM PROJECTION: (no loop data)"
+            highlights = []
+            for i, loop in enumerate(summary[:3]):
+                base = loop.get("base", {})
+                derived = loop.get("derived", {})
+                highlights.append(
+                    f"- loop_{i}: phase={base.get('phase_lock', 0):.3f} "
+                    f"coh={base.get('coherence', 0):.3f} res={base.get('resonance', 0):.3f} "
+                    f"stability={derived.get('phase_stability', 0):.3f} "
+                    f"pressure={derived.get('prompt_pressure', 0):.3f}"
+                )
+            return "QUANTUM PROJECTION (sampled loops):\n" + "\n".join(highlights)
+
+        def agent_operating_model() -> str:
+            return "\n".join([
+                "AGENT OPERATING MODEL:",
+                "- Treat signals + metrics as conditioning dials, not ground truth.",
+                "- Prefer smallest viable action set; bias toward reversible steps.",
+                "- Use QUESTIONS_FOR_USER to resolve the highest-entropy gaps first.",
+                "- If quantum_gain is high: compress explanations, emphasize verification.",
+            ])
+
+        def hypothesis_lattice() -> str:
+            return "\n".join([
+                "HYPOTHESIS LATTICE:",
+                "- Identify 3–5 plausible causes (ranked).",
+                "- Map each cause to a measurable verification step.",
+                "- Avoid asserting causality; state as hypotheses.",
+            ])
+
+        def response_tuning() -> str:
+            return "\n".join([
+                "RESPONSE TUNING:",
+                "- Keep SUMMARY to 1–2 lines, then jump to actions.",
+                "- Use short bullets, measurable checks, and explicit NextCheck times.",
+                "- Avoid long rationale; focus on operational steps.",
+            ])
+
+        base_chunks: List[Tuple[str, str, float]] = [
             ("SYSTEM_HEADER", f"RGN-CEB META-PROMPT GENERATOR\nDOMAIN={domain}\n", 10.0),
             ("STATE_METRICS", "\n".join([
                 "NOTE: metrics are internal dials, not real-world measurements.",
@@ -765,8 +1261,13 @@ class CEBChunker:
                 f"confidence={conf:.4f}",
                 f"volatility={vol:.6f}",
                 f"ceb_entropy={ent:.4f}",
+                f"quantum_gain={quantum_gain:.4f}",
+                f"shock={metrics.get('shock', 0.0):.4f}",
+                f"anomaly={metrics.get('anomaly', 0.0):.4f}",
             ]), 9.2),
             ("CEB_SIGNATURE", json.dumps(ceb_sig, ensure_ascii=False, indent=2), 8.4),
+            ("QUANTUM_ADVANCEMENTS", json.dumps(quantum, ensure_ascii=False, indent=2), 7.9),
+            ("SIGNAL_TELEMETRY", signal_telemetry(), 8.2),
             ("NONNEGOTIABLE_RULES", build_nonnegotiable_rules(), 9.0),
             ("DOMAIN_SPEC", build_domain_spec(domain), 8.8),
             ("USER_CONTEXT", build_user_context_placeholder(domain), 8.6),
@@ -780,8 +1281,42 @@ class CEBChunker:
             ]), 7.5),
         ]
 
+        optional_chunks: List[Tuple[str, str, float]] = [
+            ("QUANTUM_PROJECTION", quantum_projection(), 7.4),
+            ("AGENT_OPERATING_MODEL", agent_operating_model(), 7.3),
+            ("HYPOTHESIS_LATTICE", hypothesis_lattice(), 7.2),
+            ("RESPONSE_TUNING", response_tuning(), 7.1),
+            ("ADVANCED_IDEAS", build_advanced_quantum_ai_ideas(), 7.35),
+            ("LLAMA_LOCAL_PLAYBOOK", build_llama_local_playbook(), 7.25),
+        ]
+        if risk >= 0.66 or quantum_gain >= 0.7:
+            optional_chunks.append((
+                "CONTAINMENT_PRIORITY",
+                "CONTAINMENT PRIORITY:\n- Contain → Verify → Recover. Keep actions reversible.",
+                7.6,
+            ))
+        if conf < 0.65:
+            optional_chunks.append((
+                "UNCERTAINTY_PROTOCOL",
+                "UNCERTAINTY PROTOCOL:\n- Ask high-value questions first.\n- Use safe defaults when data missing.",
+                7.55,
+            ))
+
+        chunks = base_chunks + optional_chunks
+        required_titles = {"SYSTEM_HEADER", "STATE_METRICS", "DOMAIN_SPEC", "USER_CONTEXT", "OUTPUT_SCHEMA", "NONNEGOTIABLE_RULES"}
+
+        base_count = len(base_chunks)
+        # The target max chunk count scales with quantum_gain to surface
+        # more advanced instructions when the system is "coherent."
+        target_max = min(self.max_chunks, max(base_count, 10 + int(quantum_gain * 4)))
+        required = [c for c in chunks if c[0] in required_titles]
+        optional = [c for c in chunks if c[0] not in required_titles]
+        optional.sort(key=lambda c: c[2], reverse=True)
+        selected = required + optional
+        selected = selected[:target_max]
+
         out: List[PromptChunk] = []
-        for i, (title, txt, base_w) in enumerate(chunks[: self.max_chunks]):
+        for i, (title, txt, base_w) in enumerate(selected):
             rgb = pick_rgb(i)
             w = base_w * (1.0 + 0.55 * risk + 0.25 * abs(drift)) * (0.85 + 0.15 * conf)
             out.append(PromptChunk(
@@ -859,11 +1394,13 @@ class TempTokenAgent(SubPromptAgent):
         conf = float(ctx["confidence"])
         vol = float(ctx["volatility"])
         drift = float(ctx["drift"])
+        quantum_gain = float(ctx.get("quantum_gain", 0.0))
 
         base_temp = 0.35 + 0.22 * (1.0 - risk)
         base_temp -= 0.14 * (1.0 - conf)
         base_temp -= 0.10 * min(1.0, vol)
         base_temp -= 0.08 * min(1.0, abs(drift))
+        base_temp -= 0.12 * min(1.0, quantum_gain)
         temp = float(max(0.06, min(0.75, base_temp)))
 
         est_in = self._estimate_tokens(draft.render(with_rgb_tags=True))
@@ -873,6 +1410,7 @@ class TempTokenAgent(SubPromptAgent):
             out = 384
         else:
             out = 500 + int(450 * min(1.0, risk + (1.0 - conf)))
+            out = int(out * (0.88 + 0.24 * (1.0 - quantum_gain)))
             out = min(1100, max(256, out))
 
         return f"[ACTION:SET_TEMPERATURE value={temp}] [ACTION:SET_MAX_TOKENS value={out}]"
@@ -916,9 +1454,18 @@ class PromptOrchestrator:
         ceb_sig: Dict[str, Any],
         base_rgb: np.ndarray,
         max_prompt_chars: int = 22000,
-        with_rgb_tags: bool = True
+        with_rgb_tags: bool = True,
+        signal_summary: Optional[Dict[str, Any]] = None,
     ) -> PromptPlan:
-        chunks = self.chunker.build(domain=domain, metrics=metrics, ceb_sig=ceb_sig, base_rgb=base_rgb)
+        # Orchestrate chunk building, agent actions, and length guarding into a
+        # final PromptPlan with metadata for debugging/telemetry.
+        chunks = self.chunker.build(
+            domain=domain,
+            metrics=metrics,
+            ceb_sig=ceb_sig,
+            base_rgb=base_rgb,
+            signal_summary=signal_summary,
+        )
         draft = PromptDraft(chunks=chunks, temperature=0.35, max_tokens=512)
 
         ctx = dict(metrics)
@@ -936,6 +1483,7 @@ class PromptOrchestrator:
             "chars": len(prompt),
             "ceb_entropy": float(ceb_sig.get("entropy", 0.0)),
             "top_colors": [t["rgb"] for t in ceb_sig.get("top", [])[:6]],
+            "signals": signal_summary or {},
         }
         return PromptPlan(domain=domain, prompt=prompt, temperature=draft.temperature, max_tokens=draft.max_tokens, meta=meta)
 
@@ -953,6 +1501,68 @@ class HttpxOpenAIClient:
         self.timeout = httpx.Timeout(timeout_s)
 
     def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/responses"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        payload = {
+            "model": self.model,
+            "input": prompt,
+            "temperature": float(temperature),
+            "max_output_tokens": int(max_tokens),
+            "store": False,
+        }
+
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, headers=headers, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    out = self._extract_text_from_responses_api(j)
+                    if out:
+                        return out
+                    return json.dumps(j, ensure_ascii=False)
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"OpenAI call failed: {last_err}")
+
+    @staticmethod
+    def _extract_text_from_responses_api(j: Dict[str, Any]) -> str:
+        texts: List[str] = []
+        for item in j.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content", []) or []:
+                if part.get("type") != "output_text":
+                    continue
+                t = part.get("text")
+                if isinstance(t, str) and t.strip():
+                    texts.append(t)
+        return "\n".join(texts).strip()
+
+    def chat_longform(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        chunks = chunk_text_for_longform(prompt, max_chars=3800)
+        outputs = []
+        for idx, chunk in enumerate(chunks, start=1):
+            header = f"[CHUNK {idx}/{len(chunks)}]\n"
+            outputs.append(self.chat(header + chunk, temperature=temperature, max_tokens=max_tokens, retries=retries))
+        return concat_longform(outputs)
+
+
+class HttpxGrokClient:
+    def __init__(self, api_key: str, base_url: str = GROK_BASE_URL, model: str = GROK_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GROK_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GROK_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
         url = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
         payload = {
@@ -961,7 +1571,6 @@ class HttpxOpenAIClient:
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
-
         last_err: Optional[Exception] = None
         with httpx.Client(timeout=self.timeout) as client:
             for attempt in range(int(retries)):
@@ -974,7 +1583,104 @@ class HttpxOpenAIClient:
                 except Exception as e:
                     last_err = e
                     time.sleep((2 ** attempt) * 0.6)
-        raise RuntimeError(f"OpenAI call failed: {last_err}")
+        raise RuntimeError(f"Grok call failed: {last_err}")
+
+
+class HttpxGeminiClient:
+    def __init__(self, api_key: str, base_url: str = GEMINI_BASE_URL, model: str = GEMINI_MODEL, timeout_s: float = 60.0):
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set.")
+        if not base_url:
+            raise RuntimeError("GEMINI_BASE_URL not set.")
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = httpx.Timeout(timeout_s)
+
+    def chat(self, prompt: str, temperature: float, max_tokens: int, retries: int = 3) -> str:
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_tokens)},
+        }
+        last_err: Optional[Exception] = None
+        with httpx.Client(timeout=self.timeout) as client:
+            for attempt in range(int(retries)):
+                try:
+                    r = client.post(url, json=payload)
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                    j = r.json()
+                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception as e:
+                    last_err = e
+                    time.sleep((2 ** attempt) * 0.6)
+        raise RuntimeError(f"Gemini call failed: {last_err}")
+
+
+def download_llama3_model(target_path: str) -> None:
+    if not LLAMA3_MODEL_URL or not LLAMA3_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_MODEL_URL or LLAMA3_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3 model hash mismatch.")
+
+
+def download_llama3_2_model(target_path: str) -> None:
+    if not LLAMA3_2_MODEL_URL or not LLAMA3_2_MODEL_SHA256:
+        raise RuntimeError("LLAMA3_2_MODEL_URL or LLAMA3_2_MODEL_SHA256 not set.")
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with httpx.stream("GET", LLAMA3_2_MODEL_URL, timeout=120.0) as r:
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        hasher = hashlib.sha256()
+        with target.open("wb") as f:
+            for chunk in r.iter_bytes():
+                if not chunk:
+                    continue
+                hasher.update(chunk)
+                f.write(chunk)
+    if hasher.hexdigest().lower() != LLAMA3_2_MODEL_SHA256.lower():
+        target.unlink(missing_ok=True)
+        raise RuntimeError("Llama3.2 model hash mismatch.")
+
+
+def encrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    data = Path(src_path).read_bytes()
+    encrypted = aesgcm.encrypt(nonce, data, None)
+    Path(dst_path).write_bytes(nonce + encrypted)
+
+
+def decrypt_llama3_model(src_path: str, dst_path: str) -> None:
+    if not LLAMA3_AES_KEY_B64:
+        raise RuntimeError("LLAMA3_AES_KEY_B64 not set.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    key = base64.b64decode(LLAMA3_AES_KEY_B64.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    blob = Path(src_path).read_bytes()
+    nonce = blob[:12]
+    data = blob[12:]
+    decrypted = aesgcm.decrypt(nonce, data, None)
+    Path(dst_path).write_bytes(decrypted)
 
 
 # =============================================================================
@@ -1003,13 +1709,21 @@ class RGNCebSystem:
         self.memory = HierarchicalEntropicMemory()
         self.ceb = CEBEngine(n_cebs=24)
         self.orch = PromptOrchestrator()
+        self.signal_pipeline = SignalPipeline()
+        self.last_signals: Optional[SystemSignals] = None
+        self._plan_cache: Dict[str, Tuple[Tuple[Any, ...], PromptPlan]] = {}
 
         self.last_scans: Dict[str, DomainScan] = {}
         self.focus_idx = 0
         self._lock = threading.Lock()
 
     def scan_once(self) -> Dict[str, DomainScan]:
-        signals = SystemSignals.sample()
+        # One full scan: sample signals, build entropy/lattice, evolve CEBs,
+        # compute per-domain metrics, and assemble prompt plans. This is the
+        # main heartbeat of the system.
+        raw_signals = SystemSignals.sample()
+        signals = self.signal_pipeline.update(raw_signals)
+        self.last_signals = signals
         lattice = rgb_quantum_lattice(signals)
         ent_blob = amplify_entropy(signals, lattice)
         base_rgb = rgb_entropy_wheel(signals)
@@ -1024,32 +1738,81 @@ class RGNCebSystem:
         st = self.ceb.evolve(st0, entropy_blob=ent_blob, steps=180, drift_bias=global_bias, chroma_gain=1.15)
         p = self.ceb.probs(st)
         sig = self.ceb.signature(st, k=12)
+        if sig.get("entropy", 0.0) < 3.0:
+            st = self.ceb.evolve(st, entropy_blob=ent_blob, steps=90, drift_bias=global_bias, chroma_gain=1.25)
+            p = self.ceb.probs(st)
+            sig = self.ceb.signature(st, k=12)
 
         scans: Dict[str, DomainScan] = {}
+
+        self.memory.decay()
 
         for d in self.domains:
             sl = _domain_slice(d, p)
             d_entropy = domain_entropy_from_slice(sl)
             self.memory.update(d, d_entropy)
 
-            drift = self.memory.drift(d)
+            drift = self.memory.weighted_drift(d)
             conf = self.memory.confidence(d)
             vol = self.memory.stats(d)["volatility"]
+            shock = self.memory.shock(d)
+            anomaly = self.memory.anomaly(d)
 
             base_risk = domain_risk_from_ceb(d, p)
             risk = apply_cross_domain_bias(d, base_risk, self.memory)
+            risk = adjust_risk_by_confidence(risk, conf, vol)
+            risk = adjust_risk_by_instability(risk, shock, anomaly)
             status = status_from_risk(risk)
 
-            metrics = {"risk": float(risk), "drift": float(drift), "confidence": float(conf), "volatility": float(vol)}
+            metrics = {
+                "risk": float(risk),
+                "drift": float(drift),
+                "confidence": float(conf),
+                "volatility": float(vol),
+                "shock": float(shock),
+                "anomaly": float(anomaly),
+            }
+            quantum_summary = build_quantum_advancements(signals, sig, metrics, loops=5)
+            metrics["quantum_gain"] = float(quantum_summary.get("quantum_gain", 0.0))
+            metrics["quantum_summary"] = quantum_summary
 
-            plan = self.orch.build_plan(
-                domain=d,
-                metrics=metrics,
-                ceb_sig=sig,
-                base_rgb=base_rgb,
-                max_prompt_chars=22000,
-                with_rgb_tags=True,
+            top_colors = [tuple(t.get("rgb", [])) for t in sig.get("top", [])[:6]]
+            sig_key = tuple(int(c) for rgb in top_colors for c in rgb)
+            key = (
+                round(metrics["risk"], 4),
+                round(metrics["drift"], 4),
+                round(metrics["confidence"], 4),
+                round(metrics["volatility"], 4),
+                round(metrics.get("shock", 0.0), 4),
+                round(metrics.get("anomaly", 0.0), 4),
+                round(metrics.get("quantum_gain", 0.0), 4),
+                sig_key,
             )
+            plan = None
+            cache = self._plan_cache.get(d)
+            if cache and cache[0] == key:
+                plan = cache[1]
+            if plan is None:
+                signal_summary = {
+                    "cpu": round(signals.cpu_percent, 2),
+                    "disk": round(signals.disk_percent, 2),
+                    "ram_ratio": round(signals.ram_ratio, 3),
+                    "net_rate": int(signals.net_rate),
+                    "uptime_s": int(signals.uptime_s),
+                    "proc": int(signals.proc_count),
+                    "jitter": round(signals.cpu_jitter + signals.disk_jitter, 3),
+                    "quantum_gain": round(metrics["quantum_gain"], 4),
+                }
+                plan = self.orch.build_plan(
+                    domain=d,
+                    metrics=metrics,
+                    ceb_sig=sig,
+                    base_rgb=base_rgb,
+                    max_prompt_chars=MAX_PROMPT_CHARS,
+                    with_rgb_tags=True,
+                    signal_summary=signal_summary,
+                )
+                self._plan_cache[d] = (key, plan)
 
             prev_out = ""
             with self._lock:
@@ -1078,6 +1841,9 @@ class RGNCebSystem:
 
     def cycle_focus(self) -> None:
         self.focus_idx = (self.focus_idx + 1) % len(self.domains)
+
+    def get_last_signals(self) -> Optional[SystemSignals]:
+        return self.last_signals
 
 
 # =============================================================================
@@ -1140,13 +1906,14 @@ class AdvancedTUI:
         self.last_refresh = 0.0
         self._lock = threading.Lock()
         self._color_cache = ColorPairCache(max_pairs=72)
+        self._last_ai_time: Dict[str, float] = {}
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
         line = f"{ts} {msg}"
         with self._lock:
             self.logs.append(line)
-            self.logs = self.logs[-160:]
+            self.logs = self.logs[-LOG_BUFFER_LINES:]
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -1206,13 +1973,16 @@ class AdvancedTUI:
                 self._run_ai_for_focus()
 
     def _draw(self, stdscr) -> None:
+        # Render a full frame: dashboard, signature, prompt panel, logs,
+        # and a signal status bar. Keep operations small to stay within
+        # the TUI refresh cadence.
         stdscr.erase()
         h, w = stdscr.getmaxyx()
 
         dash_h = 9
         log_h = 6
         sig_h = 10
-        mid_h = h - dash_h - log_h
+        mid_h = h - dash_h - log_h - 1
         sig_h = min(sig_h, max(6, mid_h // 2))
 
         focus = self.sys.get_focus_domain()
@@ -1241,7 +2011,8 @@ class AdvancedTUI:
                 focus=focus,
             )
 
-        self._draw_logs(stdscr, logs_copy, y=h - log_h, x=2, height=log_h, width=w - 4)
+        self._draw_logs(stdscr, logs_copy, y=h - log_h - 1, x=2, height=log_h, width=w - 4)
+        self._draw_statusbar(stdscr, y=h - 1, width=w)
         stdscr.refresh()
 
     def _draw_dashboard(self, stdscr, scans: Dict[str, DomainScan], y: int, x: int, height: int, width: int, focus: str) -> None:
@@ -1346,7 +2117,20 @@ class AdvancedTUI:
             stdscr.addstr(row, x, ln[:width - 1], curses.A_DIM)
             row += 1
 
+    def _draw_statusbar(self, stdscr, y: int, width: int) -> None:
+        sig = self.sys.get_last_signals()
+        if not sig:
+            return
+        msg = (
+            f"CPU {sig.cpu_percent:5.1f}% | DISK {sig.disk_percent:5.1f}% | "
+            f"RAM {sig.ram_ratio * 100:5.1f}% | NET {sig.net_rate:8.0f}B/s | "
+            f"UP {sig.uptime_s:8.0f}s | PROC {sig.proc_count:5d} | JIT {sig.cpu_jitter + sig.disk_jitter:5.2f}"
+        )
+        stdscr.addstr(y, 0, msg[: max(0, width - 1)], curses.A_REVERSE)
+
     def _run_ai_for_focus(self) -> None:
+        # AI calls are optional and rate-limited. We enforce cooldown to
+        # prevent repeated API calls from overwhelming the user or quota.
         focus = self.sys.get_focus_domain()
         with self._lock:
             s = self.scans.get(focus)
@@ -1357,8 +2141,14 @@ class AdvancedTUI:
         if not OPENAI_API_KEY:
             self.log("OPENAI_API_KEY not set.")
             return
+        last = self._last_ai_time.get(focus, 0.0)
+        if time.time() - last < AI_COOLDOWN_SECONDS:
+            wait_s = int(AI_COOLDOWN_SECONDS - (time.time() - last))
+            self.log(f"AI cooldown active ({wait_s}s remaining).")
+            return
 
         self.log(f"AI run start for {focus}...")
+        self._last_ai_time[focus] = time.time()
 
         def worker():
             try:
